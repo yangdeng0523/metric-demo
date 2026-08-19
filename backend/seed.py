@@ -7,11 +7,13 @@
 """
 import datetime as dt
 import random
+import secrets
 
 from models import (
     init_db, get_session, STATUS_PUBLISHED,
     SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
     AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
+    DownstreamApp, Dataset, AppDatasetGrant,
     DimCity, DimCategory, DimUser,
     DwdOrderDetail, DwdPayDetail, DwdRefundDetail,
 )
@@ -163,12 +165,44 @@ def seed_metadata(s):
 
     # 下游模型（指标汇总表，基于逻辑模型生成，未物化；可 POST .../materialize 落地）
     # 注意：definition_sql 在 main() 提交事务后生成（SQL 生成需跨会话读取维度元数据）
-    s.add(DownstreamModel(
+    ds = DownstreamModel(
         code="city_order_daily", name="城市订单日汇总", source_model_id=lm.id,
         metrics=[{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]},
                  {"metric_code": "order_count", "dim_codes": ["dim_city"]}],
         granularity="day",
-        description="按城市+日汇总的订单金额/笔数 DWS 表，支持物化为 dl_city_order_daily"))
+        description="按城市+日汇总的订单金额/笔数 DWS 表，支持物化为 dl_city_order_daily")
+    s.add(ds)
+    s.flush()
+
+    # 下游应用（开放 API 接入方）
+    apps = [
+        DownstreamApp(code="report_bi", name="报表看板系统", appkey=secrets.token_hex(10),
+                      appsecret=secrets.token_urlsafe(24), description="BI 报表/看板（读 DWS 数据集）"),
+        DownstreamApp(code="data_science", name="数据科学平台", appkey=secrets.token_hex(10),
+                      appsecret=secrets.token_urlsafe(24), description="实时指标分析（直接查询指标）"),
+    ]
+    s.add_all(apps)
+    s.flush()
+
+    # 数据集：下游模型（物化表）/ 指标查询（动态 SQL）两种源
+    datasets = [
+        Dataset(code="ds_city_daily", name="城市订单日报", source_type="downstream_model",
+                source_model_id=ds.id, granularity="day",
+                description="城市+日粒度的订单金额/笔数汇总（源：dl_city_order_daily 物化表）"),
+        Dataset(code="ds_city_metrics", name="城市核心指标", source_type="metric_query",
+                metric_codes=["order_amount_sum", "order_count"],
+                dim_codes=["dim_city"], granularity="day",
+                description="城市维度实时指标查询（下单金额/下单次数，动态 SQL 计算）"),
+    ]
+    s.add_all(datasets)
+    s.flush()
+
+    # 授权：报表看板系统 -> 两个数据集；数据科学平台 -> 仅实时指标
+    s.add_all([
+        AppDatasetGrant(app_id=apps[0].id, dataset_id=datasets[0].id),
+        AppDatasetGrant(app_id=apps[0].id, dataset_id=datasets[1].id),
+        AppDatasetGrant(app_id=apps[1].id, dataset_id=datasets[1].id),
+    ])
 
 
 def seed_physical(s):
@@ -235,6 +269,7 @@ def main():
         print("种子数据完成：元数据 + 物理事实表（30 天）")
         for tbl in ["meta_atomic_metric", "meta_derived_metric", "meta_composite_metric",
                     "meta_logical_model", "meta_downstream_model",
+                    "meta_downstream_app", "meta_dataset", "meta_app_dataset",
                     "dwd_order_detail", "dwd_pay_detail", "dwd_refund_detail"]:
             from sqlalchemy import text
             from models import engine

@@ -14,29 +14,36 @@
   P2 可视化看板      前端基于查询结果渲染图表
 """
 import datetime as dt
+import hmac
 import io
+import secrets
+import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 
 from models import (
     get_session, engine, STATUS_DRAFT, STATUS_PUBLISHED,
     SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
     AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
+    DownstreamApp, Dataset, AppDatasetGrant, ApiCallLog,
 )
 from sql_generator import SQLGenerator, MetricNotFoundError, _safe_ident, GRANULARITY_FMT
 
 AGG_FUNCTIONS = ("SUM", "COUNT", "AVG", "MAX", "MIN", "COUNT_DISTINCT")
 TIME_PERIODS = ("1d", "7d", "30d", "90d", "ytd", "custom")
 FILTER_OPS = ("=", "!=", ">", ">=", "<", "<=", "IN", "NOT IN", "BETWEEN", "LIKE")
+DATASET_SOURCES = ("downstream_model", "metric_query")
+APP_STATUSES = ("ENABLED", "DISABLED")
 
 router = APIRouter()
+openapi_router = APIRouter()
 gen = SQLGenerator()
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -1259,6 +1266,448 @@ def downstream_data(model_id: int, page: int = 1, page_size: int = 100):
 
 
 # ===========================================================================
+# 5.10 下游应用 + 数据集 + 开放 API（下游消费面）
+# 数据集双源：downstream_model（读物化表 dl_xxx）/ metric_query（动态 SQL 实时计算）
+# 开放 API：X-App-Key + X-App-Secret 请求头认证；openapi_router 仅挂载 /openapi
+# ===========================================================================
+
+class DownstreamAppIn(BaseModel):
+    code: str
+    name: str
+    description: str = ""
+    status: str = "ENABLED"
+
+
+class DatasetIn(BaseModel):
+    code: str
+    name: str
+    source_type: str
+    source_model_id: Optional[int] = None
+    metric_codes: list = []
+    dim_codes: list = []
+    granularity: str = "day"
+    description: str = ""
+
+
+class GrantIn(BaseModel):
+    app_id: int
+
+
+# ---- 下游应用 CRUD ---------------------------------------------------------
+
+@router.post("/downstream-apps", tags=["下游应用"])
+def create_downstream_app(body: DownstreamAppIn):
+    s = get_session()
+    try:
+        _check_code(s, DownstreamApp, body.code)
+        if body.status not in APP_STATUSES:
+            raise HTTPException(400, f"非法状态: {body.status}")
+        app = DownstreamApp(code=body.code, name=body.name,
+                            description=body.description, status=body.status,
+                            appkey=secrets.token_hex(10),
+                            appsecret=secrets.token_urlsafe(24))
+        s.add(app)
+        s.commit()
+        return ok({"id": app.id, "appkey": app.appkey, "appsecret": app.appsecret})
+    finally:
+        s.close()
+
+
+@router.get("/downstream-apps", tags=["下游应用"])
+def list_downstream_apps(page: int = 1, page_size: int = 20, keyword: str = ""):
+    s = get_session()
+    try:
+        q = s.query(DownstreamApp).order_by(DownstreamApp.id.desc())
+        if keyword:
+            like = f"%{keyword}%"
+            q = q.filter(or_(DownstreamApp.code.like(like),
+                             DownstreamApp.name.like(like)))
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = []
+        for a in rows:
+            items.append({
+                "id": a.id, "code": a.code, "name": a.name,
+                "appkey": a.appkey, "appsecret": a.appsecret,
+                "status": a.status, "description": a.description,
+                "call_count": s.query(ApiCallLog).filter_by(app_id=a.id).count(),
+                "dataset_count": s.query(AppDatasetGrant).filter_by(app_id=a.id).count(),
+                "created_at": (a.created_at.strftime("%Y-%m-%d %H:%M")
+                               if a.created_at else ""),
+            })
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.get("/downstream-apps/{app_id}", tags=["下游应用"])
+def get_downstream_app(app_id: int):
+    s = get_session()
+    try:
+        a = _get_or_404(s, DownstreamApp, app_id, "下游应用")
+        ds = (s.query(Dataset)
+              .join(AppDatasetGrant, AppDatasetGrant.dataset_id == Dataset.id)
+              .filter(AppDatasetGrant.app_id == a.id).all())
+        return ok({
+            "id": a.id, "code": a.code, "name": a.name,
+            "appkey": a.appkey, "appsecret": a.appsecret,
+            "status": a.status, "description": a.description,
+            "dataset_ids": [d.id for d in ds],
+            "datasets": [{"id": d.id, "code": d.code, "name": d.name} for d in ds],
+        })
+    finally:
+        s.close()
+
+
+@router.put("/downstream-apps/{app_id}", tags=["下游应用"])
+def update_downstream_app(app_id: int, body: DownstreamAppIn):
+    s = get_session()
+    try:
+        a = _get_or_404(s, DownstreamApp, app_id, "下游应用")
+        _check_code(s, DownstreamApp, body.code, exclude_id=app_id)
+        if body.status not in APP_STATUSES:
+            raise HTTPException(400, f"非法状态: {body.status}")
+        for k, v in body.dict().items():
+            setattr(a, k, v)
+        s.commit()
+        return ok({"id": a.id})
+    finally:
+        s.close()
+
+
+@router.post("/downstream-apps/{app_id}/reset-secret", tags=["下游应用"])
+def reset_app_secret(app_id: int):
+    """重置 AppSecret（AppKey 不变），旧密钥立即失效"""
+    s = get_session()
+    try:
+        a = _get_or_404(s, DownstreamApp, app_id, "下游应用")
+        a.appsecret = secrets.token_urlsafe(24)
+        s.commit()
+        return ok({"appkey": a.appkey, "appsecret": a.appsecret})
+    finally:
+        s.close()
+
+
+@router.delete("/downstream-apps/{app_id}", tags=["下游应用"])
+def delete_downstream_app(app_id: int):
+    s = get_session()
+    try:
+        a = _get_or_404(s, DownstreamApp, app_id, "下游应用")
+        s.query(ApiCallLog).filter_by(app_id=a.id).delete()
+        s.query(AppDatasetGrant).filter_by(app_id=a.id).delete()
+        s.delete(a)
+        s.commit()
+        return ok({"deleted": app_id})
+    finally:
+        s.close()
+
+
+# ---- 数据集 CRUD + 授权 ----------------------------------------------------
+
+def _validate_dataset(s, body):
+    if body.source_type not in DATASET_SOURCES:
+        raise HTTPException(400, f"非法数据源类型: {body.source_type}")
+    if body.granularity not in GRANULARITY_FMT:
+        raise HTTPException(400, f"非法日期粒度: {body.granularity}")
+    if body.source_type == "downstream_model":
+        if not body.source_model_id:
+            raise HTTPException(400, "downstream_model 类型必须指定来源下游模型")
+        _get_or_404(s, DownstreamModel, body.source_model_id, "下游模型")
+    else:
+        for c in body.metric_codes:
+            try:
+                gen.find_metric(c)
+            except MetricNotFoundError:
+                raise HTTPException(400, f"指标不存在: {c}")
+
+
+@router.post("/datasets", tags=["数据集"])
+def create_dataset(body: DatasetIn):
+    s = get_session()
+    try:
+        _check_code(s, Dataset, body.code)
+        _validate_dataset(s, body)
+        d = Dataset(**body.dict())
+        s.add(d)
+        s.commit()
+        return ok({"id": d.id, "code": d.code})
+    finally:
+        s.close()
+
+
+@router.get("/datasets", tags=["数据集"])
+def list_datasets(page: int = 1, page_size: int = 20, keyword: str = ""):
+    s = get_session()
+    try:
+        q = s.query(Dataset).order_by(Dataset.id.desc())
+        if keyword:
+            like = f"%{keyword}%"
+            q = q.filter(or_(Dataset.code.like(like), Dataset.name.like(like)))
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = []
+        for d in rows:
+            granted_apps = (s.query(DownstreamApp)
+                            .join(AppDatasetGrant,
+                                  AppDatasetGrant.app_id == DownstreamApp.id)
+                            .filter(AppDatasetGrant.dataset_id == d.id).all())
+            items.append({
+                "id": d.id, "code": d.code, "name": d.name,
+                "source_type": d.source_type,
+                "source_model_id": d.source_model_id,
+                "source_model_name": d.source_model_name,
+                "metric_codes": d.metric_codes or [],
+                "dim_codes": d.dim_codes or [],
+                "granularity": d.granularity, "description": d.description,
+                "granted_app_ids": [a.id for a in granted_apps],
+                "granted_app_count": len(granted_apps),
+            })
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.get("/datasets/{dataset_id}", tags=["数据集"])
+def get_dataset(dataset_id: int):
+    s = get_session()
+    try:
+        d = _get_or_404(s, Dataset, dataset_id, "数据集")
+        granted_apps = (s.query(DownstreamApp)
+                        .join(AppDatasetGrant,
+                              AppDatasetGrant.app_id == DownstreamApp.id)
+                        .filter(AppDatasetGrant.dataset_id == d.id).all())
+        return ok({
+            "id": d.id, "code": d.code, "name": d.name,
+            "source_type": d.source_type,
+            "source_model_id": d.source_model_id,
+            "source_model_name": d.source_model_name,
+            "metric_codes": d.metric_codes or [],
+            "dim_codes": d.dim_codes or [],
+            "granularity": d.granularity, "description": d.description,
+            "granted_app_ids": [a.id for a in granted_apps],
+            "granted_apps": [{"id": a.id, "code": a.code, "name": a.name}
+                             for a in granted_apps],
+        })
+    finally:
+        s.close()
+
+
+@router.put("/datasets/{dataset_id}", tags=["数据集"])
+def update_dataset(dataset_id: int, body: DatasetIn):
+    s = get_session()
+    try:
+        d = _get_or_404(s, Dataset, dataset_id, "数据集")
+        _check_code(s, Dataset, body.code, exclude_id=dataset_id)
+        _validate_dataset(s, body)
+        for k, v in body.dict().items():
+            setattr(d, k, v)
+        s.commit()
+        return ok({"id": d.id})
+    finally:
+        s.close()
+
+
+@router.delete("/datasets/{dataset_id}", tags=["数据集"])
+def delete_dataset(dataset_id: int):
+    s = get_session()
+    try:
+        d = _get_or_404(s, Dataset, dataset_id, "数据集")
+        s.query(AppDatasetGrant).filter_by(dataset_id=d.id).delete()
+        s.delete(d)
+        s.commit()
+        return ok({"deleted": dataset_id})
+    finally:
+        s.close()
+
+
+@router.post("/datasets/{dataset_id}/grant", tags=["数据集"])
+def grant_dataset(dataset_id: int, body: GrantIn):
+    """授权数据集给下游应用（幂等，重复授权自动去重）"""
+    s = get_session()
+    try:
+        d = _get_or_404(s, Dataset, dataset_id, "数据集")
+        a = _get_or_404(s, DownstreamApp, body.app_id, "下游应用")
+        exists = (s.query(AppDatasetGrant)
+                  .filter_by(dataset_id=d.id, app_id=a.id).first())
+        if not exists:
+            s.add(AppDatasetGrant(dataset_id=d.id, app_id=a.id))
+            s.commit()
+        return ok({"dataset_id": d.id, "app_id": a.id, "granted": not exists})
+    finally:
+        s.close()
+
+
+@router.delete("/datasets/{dataset_id}/grant/{app_id}", tags=["数据集"])
+def revoke_dataset(dataset_id: int, app_id: int):
+    """撤销授权：应用将无法再调用该数据集"""
+    s = get_session()
+    try:
+        g = (s.query(AppDatasetGrant)
+             .filter_by(dataset_id=dataset_id, app_id=app_id).first())
+        if g:
+            s.delete(g)
+            s.commit()
+        return ok({"revoked": bool(g)})
+    finally:
+        s.close()
+
+
+# ---- 调用监控（管理端视角） ------------------------------------------------
+
+@router.get("/openapi/stats", tags=["开放 API"])
+def openapi_stats():
+    s = get_session()
+    try:
+        total = s.query(ApiCallLog).count()
+        total_rows = s.query(ApiCallLog).with_entities(
+            func.coalesce(func.sum(ApiCallLog.row_count), 0)).scalar() or 0
+        by_app = []
+        for a in s.query(DownstreamApp).all():
+            q = s.query(ApiCallLog).filter_by(app_id=a.id)
+            by_app.append({
+                "app_id": a.id, "app_code": a.code, "app_name": a.name,
+                "calls": q.count(),
+                "rows": q.with_entities(
+                    func.coalesce(func.sum(ApiCallLog.row_count), 0)).scalar() or 0,
+            })
+        by_dataset = []
+        for d in s.query(Dataset).all():
+            q = s.query(ApiCallLog).filter_by(dataset_id=d.id)
+            by_dataset.append({
+                "dataset_id": d.id, "dataset_code": d.code, "dataset_name": d.name,
+                "calls": q.count(),
+                "rows": q.with_entities(
+                    func.coalesce(func.sum(ApiCallLog.row_count), 0)).scalar() or 0,
+            })
+        return ok({"total_calls": total, "total_rows": total_rows,
+                   "by_app": by_app, "by_dataset": by_dataset})
+    finally:
+        s.close()
+
+
+@router.get("/openapi/logs", tags=["开放 API"])
+def openapi_logs(page: int = 1, page_size: int = 20,
+                 app_id: Optional[int] = None):
+    s = get_session()
+    try:
+        q = s.query(ApiCallLog).order_by(ApiCallLog.id.desc())
+        if app_id:
+            q = q.filter_by(app_id=app_id)
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = []
+        for log in rows:
+            app = s.query(DownstreamApp).get(log.app_id)
+            ds = s.query(Dataset).get(log.dataset_id)
+            items.append({
+                "id": log.id,
+                "app_code": app.code if app else str(log.app_id),
+                "app_name": app.name if app else "",
+                "dataset_code": ds.code if ds else str(log.dataset_id),
+                "dataset_name": ds.name if ds else "",
+                "row_count": log.row_count, "duration_ms": log.duration_ms,
+                "status": log.status,
+                "called_at": (log.called_at.strftime("%Y-%m-%d %H:%M:%S")
+                              if log.called_at else ""),
+            })
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
+    finally:
+        s.close()
+
+
+# ---- 开放 API（下游消费面：独立路由，仅挂载 /openapi） ----------------------
+
+def _auth_app(s, request: Request):
+    """AppKey + AppSecret 认证（常数时间比较，防时序攻击）"""
+    key = request.headers.get("X-App-Key", "")
+    secret = request.headers.get("X-App-Secret", "")
+    if not key or not secret:
+        raise HTTPException(401, "缺少认证头: X-App-Key / X-App-Secret")
+    app = s.query(DownstreamApp).filter_by(appkey=key).first()
+    if not app or not hmac.compare_digest(app.appsecret, secret):
+        raise HTTPException(401, "认证失败: AppKey/AppSecret 不匹配")
+    if app.status != "ENABLED":
+        raise HTTPException(401, f"应用已停用: {app.code}")
+    return app
+
+
+def _log_call(s, app_id, dataset_id, row_count, duration_ms, status):
+    s.add(ApiCallLog(app_id=app_id, dataset_id=dataset_id,
+                     row_count=row_count, duration_ms=duration_ms, status=status))
+
+
+@openapi_router.get("/v1/datasets")
+def openapi_datasets(request: Request):
+    """当前应用（认证后）有权限的数据集列表"""
+    s = get_session()
+    try:
+        app = _auth_app(s, request)
+        datasets = (s.query(Dataset)
+                    .join(AppDatasetGrant, AppDatasetGrant.dataset_id == Dataset.id)
+                    .filter(AppDatasetGrant.app_id == app.id).all())
+        return ok({"datasets": [{
+            "code": d.code, "name": d.name, "source_type": d.source_type,
+            "granularity": d.granularity,
+            "metric_codes": d.metric_codes or [],
+            "dim_codes": d.dim_codes or [],
+            "description": d.description,
+        } for d in datasets]})
+    finally:
+        s.close()
+
+
+@openapi_router.get("/v1/datasets/{code}/data")
+def openapi_dataset_data(code: str, request: Request,
+                         page: int = 1, page_size: int = 100,
+                         start_date: Optional[str] = None,
+                         end_date: Optional[str] = None):
+    """数据集数据调用：物化表直读 / 指标实时计算，分页返回
+    downstream_model 源：读物化表 dl_{code}（未物化 -> 400）
+    metric_query 源：execute_multi 实时计算，支持可选日期覆盖
+    每次调用写入 ApiCallLog（行数/耗时/状态）"""
+    s = get_session()
+    t0 = time.time()
+    try:
+        app = _auth_app(s, request)
+        ds = s.query(Dataset).filter_by(code=code).first()
+        if not ds:
+            raise HTTPException(404, f"数据集不存在: {code}")
+        granted = (s.query(AppDatasetGrant)
+                   .filter_by(app_id=app.id, dataset_id=ds.id).first())
+        if not granted:
+            raise HTTPException(403, f"应用 {app.code} 未获授权访问数据集 {code}")
+        if ds.source_type == "downstream_model":
+            dm = _get_or_404(s, DownstreamModel, ds.source_model_id, "下游模型")
+            if not dm.materialized or not dm.physical_table:
+                raise HTTPException(400, "数据集来源下游模型尚未物化，请先执行物化")
+            tbl = _safe_ident(dm.physical_table)
+            total = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+            result = s.execute(text(
+                f"SELECT * FROM {tbl} ORDER BY date_bucket "
+                f"LIMIT {int(page_size)} OFFSET {(int(page) - 1) * int(page_size)}"))
+            ret = {"columns": list(result.keys()),
+                   "rows": [list(r) for r in result.fetchall()],
+                   "total": total, "page": page, "page_size": page_size}
+        else:
+            meta, columns, rows, sql = gen.execute_multi(
+                ds.metric_codes or [], ds.dim_codes or [],
+                start_date, end_date, ds.granularity)
+            start = (int(page) - 1) * int(page_size)
+            ret = {"columns": columns, "rows": rows[start:start + int(page_size)],
+                   "total": len(rows), "page": page, "page_size": page_size,
+                   "sql": sql}
+        _log_call(s, app.id, ds.id, len(ret["rows"]),
+                  int((time.time() - t0) * 1000), "success")
+        s.commit()
+        return ok(ret)
+    except HTTPException:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+# ===========================================================================
 # 血缘追溯（P2）：物理表/字段 -> 原子 -> 派生 -> 复合
 # ===========================================================================
 
@@ -1427,6 +1876,8 @@ def overview():
             "composite": s.query(CompositeMetric).count(),
             "logical_models": s.query(LogicalModel).count(),
             "downstream_models": s.query(DownstreamModel).count(),
+            "downstream_apps": s.query(DownstreamApp).count(),
+            "datasets": s.query(Dataset).count(),
         })
     finally:
         s.close()
@@ -1483,6 +1934,7 @@ async def unhandled_exc_handler(request, exc: Exception):
 
 app.include_router(router, prefix="/api")
 app.include_router(router, prefix="/api/v1")
+app.include_router(openapi_router, prefix="/openapi")
 
 
 @app.get("/")

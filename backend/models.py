@@ -1,6 +1,6 @@
 """统一指标维度管理平台 Demo - 元数据模型
 
-参照阿里 Dataphin 逻辑层设计：
+参照阿里 DataMetric 逻辑层设计：
   物理表 -> 原子指标 -> 派生指标 -> 复合指标 -> 下游查询
 逻辑层定义本身以元数据形式存储（元数据中心），查询时由 SQL 生成器动态拼装 SQL。
 
@@ -203,6 +203,64 @@ class DownstreamModel(Base):
     @property
     def source_model_name(self):
         return self.source_model.name if self.source_model else ""
+
+
+class DownstreamApp(Base):
+    """下游应用：接入开放 API 的应用注册（Dataphin 应用管理）
+    创建时生成 appkey/appsecret，开放接口凭 X-App-Key/X-App-Secret 认证"""
+    __tablename__ = "meta_downstream_app"
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False)
+    name = Column(String(128), nullable=False)
+    appkey = Column(String(64), unique=True, nullable=False)
+    appsecret = Column(String(64), nullable=False)
+    status = Column(String(16), default="ENABLED")   # ENABLED / DISABLED
+    description = Column(Text, default="")
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
+
+
+class Dataset(Base):
+    """数据集：供下游报表/看板消费的数据资产
+    source_type: downstream_model（读物化表 dl_xxx）/ metric_query（动态 SQL 实时计算）
+    metric_query 源配置: metric_codes + dim_codes + granularity"""
+    __tablename__ = "meta_dataset"
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False)
+    name = Column(String(128), nullable=False)
+    source_type = Column(String(32), nullable=False)   # downstream_model / metric_query
+    source_model_id = Column(Integer, ForeignKey("meta_downstream_model.id"))
+    metric_codes = Column(JSON, default=list)
+    dim_codes = Column(JSON, default=list)
+    granularity = Column(String(8), default="day")
+    description = Column(Text, default="")
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
+    source_model = relationship("DownstreamModel")
+
+    @property
+    def source_model_name(self):
+        return self.source_model.name if self.source_model else ""
+
+
+class AppDatasetGrant(Base):
+    """应用-数据集授权（多对多）：应用仅能调用已授权数据集"""
+    __tablename__ = "meta_app_dataset"
+    id = Column(Integer, primary_key=True)
+    app_id = Column(Integer, ForeignKey("meta_downstream_app.id"), nullable=False)
+    dataset_id = Column(Integer, ForeignKey("meta_dataset.id"), nullable=False)
+
+
+class ApiCallLog(Base):
+    """开放 API 调用日志（用量监控）"""
+    __tablename__ = "meta_api_log"
+    id = Column(Integer, primary_key=True)
+    app_id = Column(Integer, ForeignKey("meta_downstream_app.id"), nullable=False)
+    dataset_id = Column(Integer, ForeignKey("meta_dataset.id"), nullable=False)
+    called_at = Column(DateTime, default=now)
+    row_count = Column(Integer, default=0)
+    duration_ms = Column(Integer, default=0)
+    status = Column(String(32), default="success")    # success / 错误信息摘要
 
 
 # ---------------------------------------------------------------------------

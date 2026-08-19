@@ -20,6 +20,8 @@ let PROCESSES = [];
 let PHYSICAL_TABLES = [];
 let LOGICAL_MODELS = [];
 let DOWNSTREAMS = [];
+let APPS = [];
+let DATASETS = [];
 let CURRENT_TAB = "query";
 let LINEAGE_VIEW = "metric";
 let LAST_QUERY = null;
@@ -44,6 +46,11 @@ function toast(msg, ok = true) {
   t.textContent = msg;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 3200);
+}
+function copyText(text, label = "已复制") {
+  navigator.clipboard?.writeText(text)
+    .then(() => toast(label))
+    .catch(() => toast("复制失败", false));
 }
 
 // 统一响应解包：{code, message, data} → data；非 0 抛出 message
@@ -303,10 +310,11 @@ function closeModal() {
 
 // ---------------------------------------------------------------- 数据加载
 async function loadMeta() {
-  const [overview, metrics, dims, domains, processes, models, downstreams] = await Promise.all([
+  const [overview, metrics, dims, domains, processes, models, downstreams, apps, datasets] = await Promise.all([
     api("/overview"), api("/metrics"), api("/dimensions"),
     api("/domains?page_size=100"), api("/processes"), api("/logical-models"),
     api("/downstream-models?page_size=100"),
+    api("/downstream-apps?page_size=100"), api("/datasets?page_size=100"),
   ]);
   META = metrics;
   DIMS = dims;
@@ -314,6 +322,8 @@ async function loadMeta() {
   PROCESSES = processes;
   LOGICAL_MODELS = models;
   DOWNSTREAMS = downstreams.items || downstreams;
+  APPS = apps.items || apps;
+  DATASETS = datasets.items || datasets;
   // 物理表全集（用于逻辑模型表选择）
   const set = new Set();
   PROCESSES.forEach(p => set.add(p.physical_table));
@@ -329,7 +339,8 @@ function renderOverview(o) {
     ["domains", "主题域"], ["processes", "业务过程"], ["atomic", "原子指标"],
     ["derived", "派生指标"], ["composite", "复合指标"], ["dimensions", "维度"],
     ["logical_models", "逻辑模型"], ["downstream_models", "下游模型"],
-  ].map(([k, label]) => `<div class="overview-item"><b>${o[k]}</b><span>${label}</span></div>`).join("");
+    ["downstream_apps", "下游应用"], ["datasets", "数据集"],
+  ].map(([k, label]) => `<div class="overview-item"><b>${o[k] ?? 0}</b><span>${label}</span></div>`).join("");
 }
 
 async function refreshAll() {
@@ -349,6 +360,8 @@ const TITLES = {
   composites: ["复合指标", "基于派生指标的四则运算，如 客单价 = 支付金额 ÷ 支付笔数"],
   models: ["逻辑模型", "将物理表映射为逻辑模型，屏蔽底层表结构差异（P1）"],
   downstreams: ["下游模型", "基于逻辑模型 + 指标集合生成 DWS 汇总表，支持物化落地（P2）"],
+  datasets: ["数据集", "可被下游应用调用的数据资产：物化表直读 / 指标实时计算，供报表看板消费"],
+  openapi: ["开放 API", "下游应用通过 AppKey + AppSecret 认证直接查询数据集，调用可监控"],
   lineage: ["血缘追溯", "指标血缘（原子 → 派生 → 复合）+ 表血缘（物理表 → 逻辑模型 → 下游模型）"],
 };
 
@@ -368,6 +381,8 @@ function switchTab(tab) {
   else if (tab === "composites") renderComposites();
   else if (tab === "models") renderModels();
   else if (tab === "downstreams") renderDownstreams();
+  else if (tab === "datasets") renderDatasets();
+  else if (tab === "openapi") renderOpenapi();
   else if (tab === "lineage") renderLineage();
 }
 
@@ -442,8 +457,8 @@ function renderTable(el, cols, rows) {
   el.innerHTML = head + `<tbody>${body || `<tr><td colspan="${Math.max(cols.length, 1)}" class="empty">无数据</td></tr>`}</tbody>`;
 }
 
-function renderChart(cols, rows, nMetrics) {
-  const el = $("chart");
+function renderChart(cols, rows, nMetrics, el) {
+  el = el || $("chart");
   const nDims = cols.length - 1 - nMetrics;
   if (!rows.length) { el.innerHTML = `<p class="empty">无数据</p>`; return; }
   const data = rows.slice(0, 12);
@@ -973,6 +988,333 @@ async function downstreamOp(btn) {
     toast(e.message, false);
   }
 }
+// ---------------------------------------------------------------- 数据集
+const DS_TYPE_LABEL = { downstream_model: "物化表", metric_query: "指标实时查询" };
+
+function renderDatasets() {
+  const kw = $("kw-datasets").value.trim();
+  api(`/datasets?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
+    $("tbl-datasets").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>数据源</th><th>来源 / 配置</th><th>粒度</th><th>授权应用</th><th style="width:300px">操作</th></tr></thead>
+      <tbody>${(d.items || []).map(x => `<tr>
+        <td><code>${esc(x.code)}</code></td>
+        <td>${esc(x.name)}</td>
+        <td>${x.source_type === "downstream_model"
+          ? `<span class="badge status pub">物化表</span>`
+          : `<span class="badge status">指标实时查询</span>`}</td>
+        <td>${x.source_type === "downstream_model"
+          ? esc(x.source_model_name)
+          : (x.metric_codes || []).map(c => `<span class="tag agg">${esc(c)}</span>`).join(" ")
+            + (x.dim_codes || []).map(c => ` <code>${esc(c)}</code>`).join("")}</td>
+        <td>${GRANULARITY_LABEL[x.granularity] || x.granularity}</td>
+        <td>${x.granted_app_count > 0
+          ? `<span class="tag">${x.granted_app_count} 个应用</span>`
+          : '<span class="hint-text">未授权</span>'}</td>
+        <td>
+          <button class="btn-ghost btn-sm" data-act="preview" data-id="${x.id}">预览</button>
+          <button class="btn-ghost btn-sm" data-act="grant" data-id="${x.id}">授权</button>
+          <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
+          <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
+        </td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无数据集</td></tr>`}</tbody>`;
+  });
+}
+
+async function datasetForm(id) {
+  let v = { code: "", name: "", source_type: "downstream_model",
+            source_model_id: DOWNSTREAMS[0]?.id ?? "",
+            metric_codes: [], dim_codes: ["dim_city"], granularity: "day", description: "" };
+  if (id) v = { ...v, ...(await api(`/datasets/${id}`)) };
+  const allMetrics = ["atomic", "derived"].flatMap(t => META[t]);
+  openModal({
+    title: id ? "编辑数据集" : "新建数据集",
+    width: 680,
+    fields: [
+      { key: "code", label: "编码", type: "text", required: true, placeholder: "如 ds_city_daily" },
+      { key: "name", label: "名称", type: "text", required: true, placeholder: "如 城市订单日报" },
+      { key: "source_type", label: "数据源类型", type: "select", required: true, span: 2,
+        options: [{ value: "downstream_model", label: "下游模型物化表（读 dl_ 表，查询性能好）" },
+                  { value: "metric_query", label: "指标实时查询（动态 SQL 计算，数据最新）" }] },
+      { key: "source_model_id", label: "来源下游模型", type: "select",
+        options: DOWNSTREAMS.map(m => ({ value: m.id, label: `${m.name}（${m.code}）` })) },
+      { key: "metric_codes", label: "查询指标", type: "multi", span: 2,
+        options: allMetrics.map(m => ({ value: m.code, label: `${m.name}（${m.code}）` })) },
+      { key: "dim_codes", label: "统计维度", type: "multi", span: 2, options: DIMS.map(d => ({ value: d.code, label: d.name })) },
+      { key: "granularity", label: "日期粒度", type: "select", options: Object.entries(GRANULARITY_LABEL).map(([k, l]) => ({ value: k, label: l })) },
+      { key: "description", label: "描述", type: "textarea", span: 2 },
+    ],
+    value: v,
+    onOk: async (o) => {
+      const body = {
+        code: o.code, name: o.name, source_type: o.source_type, description: o.description,
+        granularity: o.granularity,
+        source_model_id: o.source_type === "downstream_model" ? Number(o.source_model_id) : null,
+        metric_codes: o.source_type === "metric_query" ? (o.metric_codes || []) : [],
+        dim_codes: o.source_type === "metric_query" ? (o.dim_codes || []) : [],
+      };
+      if (body.source_type === "downstream_model" && !body.source_model_id) throw new Error("请选择来源下游模型");
+      if (body.source_type === "metric_query" && !body.metric_codes.length) throw new Error("请至少选择一个查询指标");
+      if (id) await put(`/datasets/${id}`, body);
+      else await post("/datasets", body);
+      await refreshAll();
+    },
+  });
+  // 数据源类型联动：downstream_model ↔ metric_query 条件字段互斥
+  const st = $("f-source_type");
+  const toggle = () => {
+    const isModel = st.value === "downstream_model";
+    [["source_model_id", isModel], ["metric_codes", !isModel], ["dim_codes", !isModel], ["granularity", !isModel]]
+      .forEach(([k, show]) => { const el = $("f-" + k); if (el) el.closest(".field").style.display = show ? "" : "none"; });
+  };
+  st.addEventListener("change", toggle);
+  toggle();
+}
+
+// 数据集授权弹窗：勾选变化 → 差异调用 grant / revoke
+async function datasetGrantModal(id) {
+  const d = await api(`/datasets/${id}`);
+  const granted = new Set(d.granted_app_ids || []);
+  $("modal-title").textContent = `数据集授权 · ${d.name}`;
+  $("modal").style.width = "620px";
+  $("modal-msg").textContent = "勾选变更后保存：新勾选自动授权，取消勾选自动撤销";
+  $("modal-msg").style.color = "var(--text-3)";
+  $("modal-ok").style.display = "";
+  $("modal-ok").textContent = "保 存";
+  $("modal-cancel").textContent = "取 消";
+  $("modal-cancel").onclick = closeModal;
+  $("modal-body").innerHTML = `<div class="chip-group">${(APPS || []).map(a =>
+    `<label class="chip${granted.has(a.id) ? " active" : ""}"><input type="checkbox" value="${a.id}" ${granted.has(a.id) ? "checked" : ""}>${esc(a.name)}（<code>${esc(a.code)}</code>）</label>`).join("") || '<p class="empty">暂无下游应用</p>'}</div>`;
+  $("modal-body").querySelectorAll("input").forEach(c => c.onchange = () => c.closest(".chip").classList.toggle("active", c.checked));
+  $("modal-backdrop").classList.add("open");
+  $("modal-close").onclick = closeModal;
+  $("modal-backdrop").onclick = e => { if (e.target === $("modal-backdrop")) closeModal(); };
+  $("modal-ok").onclick = async () => {
+    const checked = [...$("modal-body").querySelectorAll("input:checked")].map(c => Number(c.value));
+    const btn = $("modal-ok");
+    btn.disabled = true; btn.textContent = "提交中…";
+    try {
+      for (const aid of checked) if (!granted.has(aid)) await post(`/datasets/${id}/grant`, { app_id: aid });
+      for (const aid of [...granted]) if (!checked.includes(aid)) await del(`/datasets/${id}/grant/${aid}`);
+      closeModal();
+      toast("授权已更新");
+      await refreshAll();
+    } catch (e) {
+      $("modal-msg").textContent = e.message; $("modal-msg").style.color = "var(--danger)";
+    } finally {
+      btn.disabled = false; btn.textContent = "保 存";
+    }
+  };
+}
+
+// 数据集预览：物化表直读 / 指标实时查询，弹窗内表格 + 图表
+async function datasetPreview(id) {
+  const d = await api(`/datasets/${id}`);
+  if (d.source_type === "downstream_model") {
+    const dm = await api(`/downstream-models/${d.source_model_id}`);
+    if (!dm.materialized) { toast(`来源下游模型 ${dm.code} 尚未物化，无法预览`, false); return; }
+    const data = await api(`/downstream-models/${d.source_model_id}/data?page=1&page_size=50`);
+    const nMetrics = (dm.metrics || []).length;
+    datasetPreviewModal(`数据集预览 · ${d.name}（${dm.physical_table} 前 50 行）`,
+      data.columns, data.rows, nMetrics,
+      `物化表直读 · 共 ${data.total} 行 · 实时性：物化快照`);
+  } else {
+    const end = new Date(), start = new Date(Date.now() - 30 * 864e5);
+    const res = await post("/query", {
+      metric_codes: d.metric_codes || [], dim_codes: d.dim_codes || [],
+      granularity: d.granularity,
+      start_date: start.toISOString().slice(0, 10), end_date: end.toISOString().slice(0, 10),
+    });
+    datasetPreviewModal(`数据集预览 · ${d.name}（近 30 天实时计算）`,
+      res.columns, res.rows, (res.summary.metric_names || []).length,
+      `指标实时查询 · ${res.rows.length} 行 · 实时性：最新数据`);
+  }
+}
+
+function datasetPreviewModal(title, cols, rows, nMetrics, hint) {
+  $("modal-title").textContent = title;
+  $("modal").style.width = "920px";
+  $("modal-msg").textContent = "";
+  $("modal-ok").style.display = "none";
+  $("modal-cancel").textContent = "关 闭";
+  $("modal-cancel").onclick = closeModal;
+  $("modal-body").innerHTML = `
+    <div class="hint-text" style="margin-bottom:10px">${esc(hint)}</div>
+    <div class="card" style="box-shadow:none;margin-bottom:12px">
+      <div class="chart-wrap" style="height:280px"><div id="pv-chart" class="lineage-graph"></div></div>
+    </div>
+    <div class="table-wrap"><table id="pv-table"></table></div>`;
+  $("modal-backdrop").classList.add("open");
+  $("modal-close").onclick = closeModal;
+  $("modal-backdrop").onclick = e => { if (e.target === $("modal-backdrop")) closeModal(); };
+  renderTable($("pv-table"), cols, rows);
+  renderChart(cols, rows, nMetrics, $("pv-chart"));
+}
+
+// ---------------------------------------------------------------- 开放 API：下游应用
+const APP_STATUS_LABEL = { ENABLED: "启用", DISABLED: "停用" };
+
+function renderApps() {
+  const kw = $("kw-apps").value.trim();
+  api(`/downstream-apps?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
+    $("tbl-apps").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>AppKey</th><th>AppSecret</th><th>状态</th><th>累计调用</th><th>数据集</th><th style="width:270px">操作</th></tr></thead>
+      <tbody>${(d.items || []).map(x => `<tr>
+        <td><code>${esc(x.code)}</code></td>
+        <td>${esc(x.name)}</td>
+        <td class="key-mono">${esc(x.appkey)} <button class="btn-ghost btn-sm" data-copy="${esc(x.appkey)}">复制</button></td>
+        <td class="key-mono">${esc(x.appsecret.slice(0, 10))}… <button class="btn-ghost btn-sm" data-copy="${esc(x.appsecret)}">复制</button></td>
+        <td>${x.status === "ENABLED" ? `<span class="badge status pub">启用</span>` : `<span class="badge status arch">停用</span>`}</td>
+        <td class="num">${x.call_count}</td>
+        <td class="num">${x.dataset_count}</td>
+        <td>
+          <button class="btn-ghost btn-sm" data-act="toggle" data-id="${x.id}">${x.status === "ENABLED" ? "停用" : "启用"}</button>
+          <button class="btn-ghost btn-sm" data-act="reset" data-id="${x.id}">重置密钥</button>
+          <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
+          <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
+        </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无下游应用</td></tr>`}</tbody>`;
+  });
+}
+
+async function appForm(id) {
+  let v = { code: "", name: "", description: "", status: "ENABLED" };
+  if (id) v = { ...v, ...(await api(`/downstream-apps/${id}`)) };
+  openModal({
+    title: id ? "编辑下游应用" : "新建下游应用",
+    fields: [
+      { key: "code", label: "编码", type: "text", required: true, placeholder: "如 report_bi" },
+      { key: "name", label: "名称", type: "text", required: true, placeholder: "如 报表看板系统" },
+      { key: "status", label: "状态", type: "select", options: Object.entries(APP_STATUS_LABEL).map(([k, l]) => ({ value: k, label: l })) },
+      { key: "description", label: "描述", type: "textarea", span: 2, placeholder: "如 BI 报表 / 看板（消费数据集）" },
+    ],
+    value: v,
+    onOk: async (o) => {
+      if (id) {
+        await put(`/downstream-apps/${id}`, o);
+      } else {
+        const d = await post("/downstream-apps", o);
+        showCredentials(d.appkey, d.appsecret);
+      }
+      await refreshAll();
+    },
+  });
+}
+
+// 密钥展示弹窗（仅创建/重置时展示一次）
+function showCredentials(appkey, appsecret) {
+  $("modal-title").textContent = "应用密钥 · 请妥善保管";
+  $("modal").style.width = "640px";
+  $("modal-msg").textContent = "";
+  $("modal-ok").style.display = "none";
+  $("modal-cancel").textContent = "我知道了";
+  $("modal-cancel").onclick = closeModal;
+  $("modal-body").innerHTML = `
+    <div class="field" style="margin-bottom:14px"><label>AppKey</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <code style="flex:1;padding:8px;word-break:break-all">${esc(appkey)}</code>
+        <button class="btn-ghost btn-sm" data-copy="${esc(appkey)}">复制</button></div></div>
+    <div class="field"><label>AppSecret <span class="hint-text">仅本次展示，请妥善保管（存储于应用内，勿暴露到前端）</span></label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <code style="flex:1;padding:8px;word-break:break-all">${esc(appsecret)}</code>
+        <button class="btn-ghost btn-sm" data-copy="${esc(appsecret)}">复制</button></div></div>
+    <p class="hint-text" style="margin-top:12px">调用方式：请求头携带 X-App-Key / X-App-Secret 访问 /openapi/v1/datasets/&lt;code&gt;/data</p>`;
+  $("modal-backdrop").classList.add("open");
+  $("modal-close").onclick = closeModal;
+  $("modal-backdrop").onclick = e => { if (e.target === $("modal-backdrop")) closeModal(); };
+}
+
+async function appResetSecret(id) {
+  const d = await post(`/downstream-apps/${id}/reset-secret`);
+  showCredentials(d.appkey, d.appsecret);
+  await refreshAll();
+}
+
+// ---------------------------------------------------------------- 开放 API：调用演示 + 用量统计
+function renderOpenapi() {
+  renderApps();
+  renderApiStats();
+  renderApiDemo();
+}
+
+function renderApiDemo() {
+  const sel = $("demo-app");
+  const prev = sel.value;
+  sel.innerHTML = APPS.map(a => `<option value="${a.id}">${esc(a.name)}（${esc(a.code)}）</option>`).join("") || '<option value="">（暂无应用）</option>';
+  if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  sel.onchange = loadDemoDatasets;
+  loadDemoDatasets();
+}
+
+async function loadDemoDatasets() {
+  const app = APPS.find(a => a.id === Number($("demo-app").value));
+  const dsSel = $("demo-dataset");
+  if (!app) {
+    dsSel.innerHTML = '<option value="">（请先创建并授权应用）</option>';
+    updateDemoCurl();
+    return;
+  }
+  const detail = await api(`/downstream-apps/${app.id}`);
+  const list = detail.datasets || [];
+  dsSel.innerHTML = list.map(d => `<option value="${d.code}">${esc(d.name)}（${esc(d.code)}）</option>`).join("") || '<option value="">（该应用暂无授权数据集）</option>';
+  dsSel.onchange = updateDemoCurl;
+  updateDemoCurl();
+}
+
+function updateDemoCurl() {
+  const app = APPS.find(a => a.id === Number($("demo-app").value));
+  const code = $("demo-dataset").value;
+  const limit = $("demo-limit").value || 20;
+  if (!app || !code) { $("demo-curl").textContent = "// 选择应用与数据集后自动生成调用示例"; return; }
+  $("demo-curl").textContent =
+`# 下游系统调用示例（数据集 ${code}，AppKey=${app.appkey.slice(0, 8)}…）
+curl -s -H "X-App-Key: ${app.appkey}" \\
+     -H "X-App-Secret: ${app.appsecret}" \\
+     "http://127.0.0.1:8000/openapi/v1/datasets/${code}/data?page=1&page_size=${limit}"`;
+}
+
+async function callDemo() {
+  const app = APPS.find(a => a.id === Number($("demo-app").value));
+  const code = $("demo-dataset").value;
+  const limit = $("demo-limit").value || 20;
+  if (!app || !code) { toast("请选择应用与数据集", false); return; }
+  try {
+    const r = await fetch(`/openapi/v1/datasets/${encodeURIComponent(code)}/data?page=1&page_size=${limit}`, {
+      headers: { "X-App-Key": app.appkey, "X-App-Secret": app.appsecret },
+    });
+    const body = await r.json();
+    $("demo-result").textContent = JSON.stringify(body, null, 2);
+    if (r.ok && body.code === 0) {
+      $("demo-result-hint").textContent = `${body.data.rows.length} 行 · 共 ${body.data.total} 行 · ${body.data.columns.length} 列`;
+      toast("调用成功（已记入调用日志）");
+    } else {
+      $("demo-result-hint").textContent = "";
+      toast(`调用失败：${body.message}`, false);
+    }
+    renderApiStats();
+  } catch (e) {
+    $("demo-result").textContent = "// 网络错误：" + e.message;
+  }
+}
+
+async function renderApiStats() {
+  const [stats, logs] = await Promise.all([
+    api("/openapi/stats"), api("/openapi/logs?page=1&page_size=20"),
+  ]);
+  const activeApps = (stats.by_app || []).filter(a => a.calls > 0).length;
+  $("api-stats-cards").innerHTML = `
+    <div class="sum-card total"><b>${stats.total_calls}</b><span>总调用次数</span></div>
+    <div class="sum-card total"><b>${fmt(stats.total_rows)}</b><span>累计返回行数</span></div>
+    <div class="sum-card total"><b>${activeApps}</b><span>活跃应用</span></div>`;
+  $("tbl-api-by-app").innerHTML = `<thead><tr><th>应用</th><th>调用次数</th><th>返回行数</th></tr></thead><tbody>` +
+    (stats.by_app || []).map(a => `<tr><td>${esc(a.app_name)}</td><td class="num">${a.calls}</td><td class="num">${fmt(a.rows)}</td></tr>`).join("") +
+    `</tbody>`;
+  $("tbl-api-by-dataset").innerHTML = `<thead><tr><th>数据集</th><th>调用次数</th><th>返回行数</th></tr></thead><tbody>` +
+    (stats.by_dataset || []).map(d => `<tr><td>${esc(d.dataset_name)}</td><td class="num">${d.calls}</td><td class="num">${fmt(d.rows)}</td></tr>`).join("") +
+    `</tbody>`;
+  $("tbl-api-logs").innerHTML = `<thead><tr><th>时间</th><th>应用</th><th>数据集</th><th>返回行数</th><th>耗时(ms)</th><th>状态</th></tr></thead><tbody>` +
+    (logs.items || []).map(l => `<tr>
+      <td class="key-mono">${esc(l.called_at)}</td><td>${esc(l.app_name)}</td><td>${esc(l.dataset_name)}</td>
+      <td class="num">${l.row_count}</td><td class="num">${l.duration_ms}</td>
+      <td>${l.status === "success" ? `<span class="badge status pub">成功</span>` : `<span class="badge status arch">${esc(l.status)}</span>`}</td></tr>`).join("") +
+    `</tbody>`;
+}
+
 // ---------------------------------------------------------------- 血缘（指标血缘 + 表血缘双视图）
 function renderLineage() {
   document.querySelectorAll("#lineage-view-switch .seg-item")
@@ -1158,13 +1500,52 @@ function bindEvents() {
     else downstreamOp(btn);
   });
 
+  // 数据集
+  $("btn-new-dataset").onclick = listenerWrap(() => datasetForm());
+  $("tbl-datasets").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = Number(btn.dataset.id);
+    if (btn.dataset.act === "edit") datasetForm(id);
+    else if (btn.dataset.act === "del") confirmDelete("删除该数据集？（同时撤销全部授权）", () => del(`/datasets/${id}`));
+    else if (btn.dataset.act === "grant") datasetGrantModal(id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "preview") datasetPreview(id).catch(err => toast(err.message, false));
+  });
+
+  // 开放 API：下游应用
+  $("btn-new-app").onclick = listenerWrap(() => appForm());
+  $("tbl-apps").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = Number(btn.dataset.id);
+    if (btn.dataset.act === "edit") appForm(id);
+    else if (btn.dataset.act === "del") confirmDelete("删除该应用？（其调用日志一并清除）", () => del(`/downstream-apps/${id}`));
+    else if (btn.dataset.act === "reset") appResetSecret(id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "toggle") {
+      const app = APPS.find(a => a.id === id);
+      const next = app.status === "ENABLED" ? "DISABLED" : "ENABLED";
+      put(`/downstream-apps/${id}`, { code: app.code, name: app.name, description: app.description, status: next })
+        .then(() => { toast(next === "DISABLED" ? "已停用（调用将返回 401）" : "已启用"); refreshAll(); })
+        .catch(err => toast(err.message, false));
+    }
+  });
+  // 密钥复制按钮（全局委托，覆盖应用列表 / 密钥弹窗）
+  document.addEventListener("click", e => {
+    const b = e.target.closest("[data-copy]");
+    if (b) copyText(b.dataset.copy, "密钥已复制");
+  });
+
+  // 开放 API：调用演示
+  $("btn-demo-call").onclick = callDemo;
+  $("demo-limit").addEventListener("change", updateDemoCurl);
+
   // 血缘
   $("lineage-select").onchange = renderLineage;
   document.querySelectorAll("#lineage-view-switch .seg-item").forEach(b =>
     b.onclick = () => { LINEAGE_VIEW = b.dataset.view; renderLineage(); });
 
   // 各列表搜索（回车触发）
-  ["domains", "processes", "atomics", "dims", "derived", "composites", "downstreams"].forEach(tab => {
+  ["domains", "processes", "atomics", "dims", "derived", "composites", "downstreams", "datasets", "apps"].forEach(tab => {
     const el = $("kw-" + tab);
     el.addEventListener("keydown", e => { if (e.key === "Enter") switchTab(tab); });
   });

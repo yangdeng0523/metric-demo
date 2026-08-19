@@ -8,6 +8,7 @@
   5. 安全：标识符白名单防注入
   6. API：统一响应结构、引用校验（409）、编码冲突（409）、参数校验（400）
   7. 血缘：指标全链路 + 表级血缘（物理表 -> 逻辑模型 -> 下游模型 -> 物化表）
+  8. 下游应用 / 数据集 / 开放 API：AppKey+AppSecret 认证、双源调用、调用日志、注入回归
 """
 import datetime as dt
 import re
@@ -562,4 +563,291 @@ def test_lineage_tables_after_materialize(api):
     assert "table:dl_lineage_ds" in ids
     edges = {(e["from"], e["to"]) for e in d["edges"]}
     assert ("downstream:lineage_ds", "table:dl_lineage_ds") in edges
+
+
+# ===========================================================================
+# 下游应用 / 数据集 / 开放 API（AppKey+AppSecret 认证、双源调用、调用日志）
+# ===========================================================================
+
+def _mk_app(api, code):
+    """创建下游应用，返回 (id, appkey, appsecret)"""
+    r = api.post("/api/v1/downstream-apps", json={
+        "code": code, "name": f"{code} 应用", "description": "测试用"})
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    return d["id"], d["appkey"], d["appsecret"]
+
+
+def test_downstream_app_crud_and_secret(api):
+    """下游应用：创建（自动生成密钥）-> 重复编码 409 / 非法状态 400 -> 重置密钥 -> 删除"""
+    aid, key0, secret0 = _mk_app(api, "oa_app1")
+    assert len(key0) == 20 and len(secret0) >= 24  # token_hex(10) / token_urlsafe(24)
+    # 列表可见，密钥明文返回（管理端），累计调用为 0
+    items = api.get("/api/v1/downstream-apps?page_size=100").json()["data"]["items"]
+    app = [a for a in items if a["id"] == aid][0]
+    assert app["code"] == "oa_app1" and app["appkey"] == key0
+    assert app["status"] == "ENABLED" and app["call_count"] == 0
+    assert app["dataset_count"] == 0
+    # 重复编码 409、非法状态 400
+    assert api.post("/api/v1/downstream-apps", json={
+        "code": "oa_app1", "name": "重复"}).status_code == 409
+    assert api.post("/api/v1/downstream-apps", json={
+        "code": "oa_app2", "name": "x", "status": "BANNED"}).status_code == 400
+    # 重置密钥：AppKey 不变、AppSecret 变更；新密钥可认证、旧密钥失效
+    r = api.post(f"/api/v1/downstream-apps/{aid}/reset-secret")
+    assert r.status_code == 200
+    new_secret = r.json()["data"]["appsecret"]
+    assert r.json()["data"]["appkey"] == key0 and new_secret != secret0
+    h = {"X-App-Key": key0, "X-App-Secret": new_secret}
+    assert api.get("/openapi/v1/datasets", headers=h).status_code == 200
+    h_old = {"X-App-Key": key0, "X-App-Secret": secret0}
+    assert api.get("/openapi/v1/datasets", headers=h_old).status_code == 401
+    # 删除后消失
+    assert api.delete(f"/api/v1/downstream-apps/{aid}").status_code == 200
+    assert api.get(f"/api/v1/downstream-apps/{aid}").status_code == 404
+
+
+def test_dataset_crud_and_validation(api):
+    """数据集：metric_query 创建/编辑；非法参数 400；重复编码 409"""
+    payload = {"code": "oa_ds_mq", "name": "实时指标数据集", "source_type": "metric_query",
+               "metric_codes": ["order_amount_sum", "order_count"],
+               "dim_codes": ["dim_city"], "granularity": "day"}
+    r = api.post("/api/v1/datasets", json=payload)
+    assert r.status_code == 200, r.text
+    did = r.json()["data"]["id"]
+    d = api.get(f"/api/v1/datasets/{did}").json()["data"]
+    assert d["source_type"] == "metric_query" and d["granularity"] == "day"
+    assert d["metric_codes"] == ["order_amount_sum", "order_count"]
+    assert d["source_model_name"] == ""
+    # 非法校验：数据源类型 / 日期粒度 / 指标编码 / 缺来源模型
+    bads = [
+        {"code": "oa_bad1", "name": "x", "source_type": "hive_table"},
+        {"code": "oa_bad2", "name": "x", "source_type": "metric_query",
+         "metric_codes": ["order_count"], "granularity": "hour"},
+        {"code": "oa_bad3", "name": "x", "source_type": "metric_query",
+         "metric_codes": ["no_such_metric"], "granularity": "day"},
+        {"code": "oa_bad4", "name": "x", "source_type": "downstream_model"},
+    ]
+    for bad in bads:
+        assert api.post("/api/v1/datasets", json=bad).status_code == 400, bad
+    # 重复编码 409
+    assert api.post("/api/v1/datasets", json=payload).status_code == 409
+    # 编辑：改粒度
+    payload["granularity"] = "month"
+    assert api.put(f"/api/v1/datasets/{did}", json=payload).status_code == 200
+    assert api.get(f"/api/v1/datasets/{did}").json()["data"]["granularity"] == "month"
+    # 删除后消失
+    assert api.delete(f"/api/v1/datasets/{did}").status_code == 200
+    assert api.get(f"/api/v1/datasets/{did}").status_code == 404
+
+
+def test_dataset_detail_grants(api):
+    """数据集详情：授权应用列表可见；删除应用后授权记录级联清理"""
+    aid, _, _ = _mk_app(api, "oa_app_det")
+    r = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_det", "name": "详情", "source_type": "metric_query",
+        "metric_codes": ["order_count"], "dim_codes": [], "granularity": "day"})
+    did = r.json()["data"]["id"]
+    api.post(f"/api/v1/datasets/{did}/grant", json={"app_id": aid})
+    d = api.get(f"/api/v1/datasets/{did}").json()["data"]
+    assert [a["code"] for a in d["granted_apps"]] == ["oa_app_det"]
+    # 删除应用 -> 授权记录级联清理
+    assert api.delete(f"/api/v1/downstream-apps/{aid}").status_code == 200
+    d = api.get(f"/api/v1/datasets/{did}").json()["data"]
+    assert d["granted_apps"] == [] and d["granted_app_ids"] == []
+    api.delete(f"/api/v1/datasets/{did}")
+
+
+def test_openapi_auth_guard(api):
+    """开放 API 认证：缺头 401 / 密钥错 401 / 应用停用 401 / 数据集不存在 404"""
+    aid, key, secret = _mk_app(api, "oa_app_auth")
+    url = "/openapi/v1/datasets/oa_ds_none/data"
+    assert api.get(url).status_code == 401  # 缺认证头
+    assert api.get(url, headers={"X-App-Key": key}).status_code == 401
+    assert api.get(url, headers={"X-App-Secret": secret}).status_code == 401
+    h_bad = {"X-App-Key": key, "X-App-Secret": "wrong-secret"}
+    assert api.get(url, headers=h_bad).status_code == 401
+    h_bad2 = {"X-App-Key": "no-such-key", "X-App-Secret": secret}
+    assert api.get(url, headers=h_bad2).status_code == 401
+    # 停用应用：即使密钥正确也 401
+    aid2, key2, secret2 = _mk_app(api, "oa_app_off")
+    r = api.put(f"/api/v1/downstream-apps/{aid2}", json={
+        "code": "oa_app_off", "name": "停用", "status": "DISABLED"})
+    assert r.status_code == 200
+    h_off = {"X-App-Key": key2, "X-App-Secret": secret2}
+    assert api.get("/openapi/v1/datasets", headers=h_off).status_code == 401
+    # 认证通过但数据集不存在 -> 404
+    h = {"X-App-Key": key, "X-App-Secret": secret}
+    assert api.get(url, headers=h).status_code == 404
+    api.delete(f"/api/v1/downstream-apps/{aid}")
+    api.delete(f"/api/v1/downstream-apps/{aid2}")
+
+
+def test_openapi_grant_flow(api):
+    """授权流程：未授权 403 -> grant（幂等）后可调 -> revoke 后恢复 403；列表仅含已授权"""
+    aid, key, secret = _mk_app(api, "oa_app_grant")
+    h = {"X-App-Key": key, "X-App-Secret": secret}
+    r = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_grant", "name": "授权测试", "source_type": "metric_query",
+        "metric_codes": ["order_count"], "dim_codes": ["dim_city"], "granularity": "day"})
+    did = r.json()["data"]["id"]
+    url = "/openapi/v1/datasets/oa_ds_grant/data"
+    assert api.get(url, headers=h).status_code == 403
+    assert api.get("/openapi/v1/datasets", headers=h).json()["data"]["datasets"] == []
+    # grant 幂等：重复授权去重
+    assert api.post(f"/api/v1/datasets/{did}/grant", json={"app_id": aid}).status_code == 200
+    assert api.post(f"/api/v1/datasets/{did}/grant",
+                    json={"app_id": aid}).json()["data"]["granted"] is False
+    assert api.get(url, headers=h).status_code == 200
+    ds_list = api.get("/openapi/v1/datasets", headers=h).json()["data"]["datasets"]
+    assert [d["code"] for d in ds_list] == ["oa_ds_grant"]
+    # revoke 后恢复 403
+    assert api.delete(f"/api/v1/datasets/{did}/grant/{aid}").status_code == 200
+    assert api.get(url, headers=h).status_code == 403
+    api.delete(f"/api/v1/datasets/{did}")
+    api.delete(f"/api/v1/downstream-apps/{aid}")
+
+
+def test_openapi_metric_query_call(api):
+    """metric_query 源：实时 SQL 计算、列/行正确、分页、日期过滤"""
+    aid, key, secret = _mk_app(api, "oa_app_mq")
+    h = {"X-App-Key": key, "X-App-Secret": secret}
+    r = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_mq2", "name": "实时指标", "source_type": "metric_query",
+        "metric_codes": ["order_amount_sum", "order_count"],
+        "dim_codes": ["dim_city"], "granularity": "day"})
+    did = r.json()["data"]["id"]
+    api.post(f"/api/v1/datasets/{did}/grant", json={"app_id": aid})
+    url = "/openapi/v1/datasets/oa_ds_mq2/data"
+    d = api.get(url, headers=h).json()["data"]
+    # 默认窗口：最近 7 天（含今日）x 6 城市 -> 48 行
+    assert set(d["columns"]) == {"date_bucket", "dim_city",
+                                 "order_amount_sum", "order_count"}
+    assert d["total"] == 48 and len(d["rows"]) == 48
+    assert d["sql"] and "order_amount" in d["sql"]
+    row0 = dict(zip(d["columns"], d["rows"][0]))
+    assert row0["order_amount_sum"] > 0 and row0["order_count"] > 0
+    assert re.match(r"\d{4}-\d{2}-\d{2}$", row0["date_bucket"])
+    # 分页
+    d2 = api.get(url, headers=h, params={"page_size": 3, "page": 2}).json()["data"]
+    assert len(d2["rows"]) == 3
+    # 日期过滤：单日 = 6 个城市
+    day = (dt.date.today() - dt.timedelta(days=10)).isoformat()
+    d3 = api.get(url, headers=h, params={"start_date": day, "end_date": day}).json()["data"]
+    assert d3["total"] == 6
+    assert all(dict(zip(d3["columns"], r))["date_bucket"] == day for r in d3["rows"])
+    api.delete(f"/api/v1/datasets/{did}")
+    api.delete(f"/api/v1/downstream-apps/{aid}")
+
+
+def test_openapi_downstream_model_source(api):
+    """downstream_model 源：未物化 400 -> 物化后可调（物化表直读 + 分页）"""
+    lm = _trade_wide_lm(api)
+    r = api.post("/api/v1/downstream-models", json={
+        "code": "oa_dm1", "name": "开放API物化源", "source_model_id": lm["id"],
+        "granularity": "day",
+        "metrics": [{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]},
+                    {"metric_code": "order_count", "dim_codes": ["dim_city"]}]})
+    mid = r.json()["data"]["id"]
+    aid, key, secret = _mk_app(api, "oa_app_dm")
+    h = {"X-App-Key": key, "X-App-Secret": secret}
+    r = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_dm", "name": "物化表数据集", "source_type": "downstream_model",
+        "source_model_id": mid, "granularity": "day"})
+    did = r.json()["data"]["id"]
+    api.post(f"/api/v1/datasets/{did}/grant", json={"app_id": aid})
+    url = "/openapi/v1/datasets/oa_ds_dm/data"
+    # 未物化：400 提示
+    r = api.get(url, headers=h)
+    assert r.status_code == 400 and "物化" in r.json()["message"]
+    # 物化后可调：物化表直读（无动态 sql 字段）
+    assert api.post(f"/api/v1/downstream-models/{mid}/materialize").status_code == 200
+    d = api.get(url, headers=h).json()["data"]
+    assert d["columns"] == ["date_bucket", "dim_city", "order_amount_sum", "order_count"]
+    assert d["total"] > 0 and len(d["rows"]) == min(d["total"], 100)
+    assert "sql" not in d
+    # 分页
+    d2 = api.get(url, headers=h, params={"page_size": 5}).json()["data"]
+    assert len(d2["rows"]) == 5 and d2["total"] == d["total"]
+    api.delete(f"/api/v1/datasets/{did}")
+    api.delete(f"/api/v1/downstream-apps/{aid}")
     api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_openapi_call_logging_stats(api):
+    """调用日志：每次成功调用记录日志，stats 计数/行数累加"""
+    aid, key, secret = _mk_app(api, "oa_app_log")
+    h = {"X-App-Key": key, "X-App-Secret": secret}
+    r = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_log", "name": "日志", "source_type": "metric_query",
+        "metric_codes": ["order_count"], "dim_codes": ["dim_city"], "granularity": "day"})
+    did = r.json()["data"]["id"]
+    api.post(f"/api/v1/datasets/{did}/grant", json={"app_id": aid})
+    url = "/openapi/v1/datasets/oa_ds_log/data"
+    s0 = api.get("/api/v1/openapi/stats").json()["data"]
+    app0 = [x for x in s0["by_app"] if x["app_id"] == aid][0]
+    assert app0["calls"] == 0  # 尚无调用
+    for _ in range(2):
+        assert api.get(url, headers=h).status_code == 200
+    s1 = api.get("/api/v1/openapi/stats").json()["data"]
+    assert s1["total_calls"] - s0["total_calls"] == 2
+    app_stat = [x for x in s1["by_app"] if x["app_id"] == aid][0]
+    ds_stat = [x for x in s1["by_dataset"] if x["dataset_id"] == did][0]
+    assert app_stat["calls"] == 2 and app_stat["app_code"] == "oa_app_log"
+    assert ds_stat["calls"] == 2 and ds_stat["dataset_code"] == "oa_ds_log"
+    assert app_stat["rows"] > 0 and app_stat["rows"] == ds_stat["rows"]
+    # 日志：含应用/数据集/行数/耗时/状态
+    logs = api.get("/api/v1/openapi/logs", params={"page_size": 5}).json()["data"]["items"]
+    top = [x for x in logs if x["app_code"] == "oa_app_log"][0]
+    assert top["dataset_code"] == "oa_ds_log" and top["status"] == "success"
+    assert top["row_count"] > 0 and top["duration_ms"] >= 0
+    api.delete(f"/api/v1/datasets/{did}")
+    api.delete(f"/api/v1/downstream-apps/{aid}")
+
+
+def test_openapi_dataset_listing_per_app(api):
+    """各应用仅能看到被授权的数据集（列表隔离）"""
+    aid1, k1, s1 = _mk_app(api, "oa_app_l1")
+    aid2, k2, s2 = _mk_app(api, "oa_app_l2")
+    h1, h2 = {"X-App-Key": k1, "X-App-Secret": s1}, {"X-App-Key": k2, "X-App-Secret": s2}
+    did1 = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_l1", "name": "L1", "source_type": "metric_query",
+        "metric_codes": ["order_count"], "dim_codes": [], "granularity": "day"})
+    did1 = did1.json()["data"]["id"]
+    did2 = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_l2", "name": "L2", "source_type": "metric_query",
+        "metric_codes": ["order_count"], "dim_codes": [], "granularity": "day"})
+    did2 = did2.json()["data"]["id"]
+    api.post(f"/api/v1/datasets/{did1}/grant", json={"app_id": aid1})
+    api.post(f"/api/v1/datasets/{did2}/grant", json={"app_id": aid2})
+    codes1 = {d["code"] for d in
+              api.get("/openapi/v1/datasets", headers=h1).json()["data"]["datasets"]}
+    codes2 = {d["code"] for d in
+              api.get("/openapi/v1/datasets", headers=h2).json()["data"]["datasets"]}
+    assert "oa_ds_l1" in codes1 and "oa_ds_l2" not in codes1
+    assert "oa_ds_l2" in codes2 and "oa_ds_l1" not in codes2
+    api.delete(f"/api/v1/datasets/{did1}")
+    api.delete(f"/api/v1/datasets/{did2}")
+    api.delete(f"/api/v1/downstream-apps/{aid1}")
+    api.delete(f"/api/v1/downstream-apps/{aid2}")
+
+
+def test_openapi_injection_guard(api):
+    """注入回归：伪造 AppKey / 数据集编码含 SQL 片段 -> 401/404，库不受影响"""
+    aid, key, secret = _mk_app(api, "oa_app_sec")
+    h = {"X-App-Key": key, "X-App-Secret": secret}
+    r = api.post("/api/v1/datasets", json={
+        "code": "oa_ds_sec", "name": "安全", "source_type": "metric_query",
+        "metric_codes": ["order_count"], "dim_codes": ["dim_city"], "granularity": "day"})
+    did = r.json()["data"]["id"]
+    api.post(f"/api/v1/datasets/{did}/grant", json={"app_id": aid})
+    evil_key = {"X-App-Key": "x' OR '1'='1", "X-App-Secret": "x"}
+    assert api.get("/openapi/v1/datasets", headers=evil_key).status_code == 401
+    evil_code = "oa_ds_sec'; DROP TABLE meta_dataset;--"
+    assert api.get(f"/openapi/v1/datasets/{evil_code}/data", headers=h).status_code == 404
+    assert api.get("/openapi/v1/datasets/oa_ds_sec/data;--", headers=h).status_code == 404
+    # 库未受损：数据集仍在、正常调用仍成功
+    assert api.get("/api/v1/datasets?page_size=100").json()["data"]["total"] >= 3
+    assert api.get("/openapi/v1/datasets/oa_ds_sec/data", headers=h).status_code == 200
+    api.delete(f"/api/v1/datasets/{did}")
+    api.delete(f"/api/v1/downstream-apps/{aid}")

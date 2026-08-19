@@ -16,7 +16,7 @@
       </div>
       <div>
         <div class="brand-title">指标维度管理平台</div>
-        <div class="brand-sub">Dataphin 逻辑层 Demo</div>
+        <div class="brand-sub">DataMetric 逻辑层 Demo</div>
       </div>
     </div>
     <nav class="nav" id="nav">
@@ -38,6 +38,10 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/></svg>逻辑模型</a>
       <a class="nav-item" data-tab="downstreams" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10m0 0l-4-4m4 4l4-4"/><path d="M5 21h14v-6H5z"/></svg>下游模型</a>
+      <a class="nav-item" data-tab="datasets" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>数据集</a>
+      <a class="nav-item" data-tab="openapi" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M13 6l-2 12"/></svg>开放 API</a>
       <a class="nav-item" data-tab="lineage" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7 6h10M6.5 8l3.5 8M17.5 8L14 16"/></svg>血缘追溯</a>
     </nav>
@@ -219,6 +223,71 @@
             </div>
           </div>
           <div class="table-wrap"><table id="tbl-downstreams"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 数据集 ================== -->
+      <section class="tab-panel" id="tab-datasets">
+        <div class="card">
+          <div class="card-head">
+            <h2>数据集管理 <span class="hint-text">可被下游应用消费的数据资产：物化表直读 / 指标实时计算（双数据源）</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-datasets" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-dataset">+ 新建数据集</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-datasets"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 开放 API ================== -->
+      <section class="tab-panel" id="tab-openapi">
+        <div class="card">
+          <div class="card-head">
+            <h2>下游应用管理 <span class="hint-text">接入开放 API 的应用：AppKey + AppSecret 认证，授权后可调用数据集</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-apps" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-app">+ 新建应用</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-apps"></table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>API 调用演示 <span class="hint-text">下游系统按此方式直接查询数据集（请求头 X-App-Key / X-App-Secret）</span></h2>
+          </div>
+          <div class="builder-row">
+            <div class="field" style="min-width:220px"><label>选择应用</label><select id="demo-app"></select></div>
+            <div class="field" style="min-width:220px"><label>选择数据集</label><select id="demo-dataset"></select></div>
+            <div class="field" style="min-width:110px;max-width:140px"><label>每页行数</label><input type="number" id="demo-limit" value="20" min="1" max="100"></div>
+            <button class="btn-primary" id="btn-demo-call" style="height:40px">调 用</button>
+          </div>
+          <pre id="demo-curl" class="pre-dark" style="margin-top:14px">// 选择应用与数据集后自动生成调用示例</pre>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 8px">
+            <h2 style="font-size:13px">返回 JSON</h2>
+            <span class="hint-text" id="demo-result-hint"></span>
+          </div>
+          <pre id="demo-result" class="form-pre" style="max-height:360px;overflow:auto">// 点击「调用」后展示下游视角的返回结果</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>调用用量统计 <span class="hint-text">每次调用自动记录返回行数 / 耗时 / 状态</span></h2>
+          </div>
+          <div class="summary" id="api-stats-cards" style="grid-template-columns:repeat(3, 1fr)"></div>
+          <div class="grid-2" style="margin-bottom:14px">
+            <div>
+              <h3 style="font-size:13px;margin:0 0 8px">按应用统计</h3>
+              <div class="table-wrap"><table id="tbl-api-by-app"></table></div>
+            </div>
+            <div>
+              <h3 style="font-size:13px;margin:0 0 8px">按数据集统计</h3>
+              <div class="table-wrap"><table id="tbl-api-by-dataset"></table></div>
+            </div>
+          </div>
+          <h3 style="font-size:13px;margin:0 0 8px">最近调用日志</h3>
+          <div class="table-wrap"><table id="tbl-api-logs"></table></div>
         </div>
       </section>
 

@@ -1,6 +1,6 @@
 # 统一指标维度管理平台 Demo
 
-参照阿里云 **Dataphin「规范定义（逻辑层）」** 设计：**元数据驱动 + 查询时动态生成 SQL**。
+参照阿里云 **DataMetric「规范定义（逻辑层）」** 设计：**元数据驱动 + 查询时动态生成 SQL**。
 指标口径全局唯一定义，任何查询均引用同一口径 —— 解决"同一指标在不同部门口径不一致"的核心痛点。
 查询可分为**即席动态查询**（不落地）与**下游模型物化**（DWS 汇总表落地）两条路径。
 
@@ -14,6 +14,10 @@
                               |                   |
                      SQLite 物理表（dwd+dim）  物化下游模型（CREATE TABLE dl_xxx）
                      （即席查询 0 落地）        （指标汇总表，可反复重建刷新）
+                              |
+                              v
+                  开放 API（/openapi，AppKey+AppSecret 认证）
+                  下游应用按授权调用数据集，供报表看板/直接查询
 ```
 
 指标体系全链路：`物理表.字段 -> 原子指标 -> 派生指标 -> 复合指标`，血缘关系可双向追溯（影响分析 + 根因分析），并支持**表级血缘**（物理表 → 逻辑模型 → 下游模型 → 物化表）。
@@ -23,13 +27,13 @@
 ```
 metric-demo/
 ├── backend/
-│   ├── models.py         # 元数据模型（10 张表） + SQLite 引擎
+│   ├── models.py         # 元数据模型（14 张表） + SQLite 引擎
 │   ├── seed.py           # 电商 Demo 种子数据（30 天物理数据，可重复重建）
 │   ├── sql_generator.py  # 核心：元数据驱动的 SQL 动态生成器（含防注入、日期粒度、下游模型定义）
-│   └── main.py           # FastAPI 服务（/api/v1 + 静态前端）
-├── frontend/             # 单页前端（查询/管理/血缘/下游模型/导出，离线可用）
-├── tests/                # pytest 单元测试（35 个用例）
-├── docs/                 # 需求文档 vs Dataphin 对照分析
+│   └── main.py           # FastAPI 服务（/api/v1 管理端 + /openapi 下游消费端 + 静态前端）
+├── frontend/             # 单页前端（查询/管理/血缘/下游模型/数据集/开放 API，离线可用）
+├── tests/                # pytest 单元测试（45 个用例）
+├── docs/                 # 需求文档 vs DataMetric 对照分析
 └── metadata.db           # SQLite 数据库（seed 后生成）
 ```
 
@@ -45,7 +49,7 @@ cd backend && ../.venv/bin/python seed.py && cd ..
 cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 
 # 3. 浏览器访问
-#   http://127.0.0.1:8000         管理界面（10 个页签：查询/主题域/业务过程/原子/维度/派生/复合/逻辑模型/下游模型/血缘）
+#   http://127.0.0.1:8000         管理界面（12 个页签：查询/主题域/业务过程/原子/维度/派生/复合/逻辑模型/下游模型/数据集/开放 API/血缘）
 #   http://127.0.0.1:8000/docs    Swagger API 文档（自动生成）
 ```
 
@@ -55,7 +59,7 @@ cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 
 ```bash
 cd metric-demo
-METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 35 passed
+METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 45 passed
 # 测试使用独立临时库，不污染正式数据
 ```
 
@@ -70,6 +74,8 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 35 passed
 | 复合指标 | 客单价 = 支付金额/支付笔数、退款率 = 退款金额/支付金额（含零值保护） |
 | 逻辑模型 | 订单交易宽表（dwd_order_detail JOIN 城市/类目维度） |
 | 下游模型 | 城市订单日汇总（order_amount_sum + order_count × dim_city，日粒度），可物化为 `dl_city_order_daily` |
+| 下游应用 | 报表看板系统（report_bi）、数据科学平台（data_science）——各持 AppKey/AppSecret |
+| 数据集 | 城市订单日报（物化表直读 `dl_city_order_daily`）、城市核心指标（指标实时计算）——授权给下游应用调用 |
 
 ## 核心 API（全部 /api/v1 前缀）
 
@@ -86,6 +92,8 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 35 passed
 | 复合指标 | `POST/GET/PUT/DELETE /composite-metrics`、`GET .../{id}` | 四则运算表达式；`GET .../{id}/sql-preview` |
 | 逻辑模型 | `POST/GET/PUT/DELETE /logical-models`、`GET .../{id}` | SINGLE/JOIN 类型 + JOIN 配置，返回 generated_sql |
 | 下游模型 | `POST/GET/PUT/DELETE /downstream-models`、`GET .../{id}` | 指标汇总表（DWS）定义，生成 definition_sql 入库；已物化则编辑/删除自动清理落地表 |
+| 下游应用 | `POST/GET/PUT/DELETE /downstream-apps`、`GET .../{id}` | 开放 API 接入方；创建自动生成 `appkey`+`appsecret`；`POST .../{id}/reset-secret` 重置密钥（AppKey 不变） |
+| 数据集 | `POST/GET/PUT/DELETE /datasets`、`GET .../{id}` | 供下游调用的数据资产，双数据源：`downstream_model`（物化表直读）/ `metric_query`（指标实时计算）；`POST .../{id}/grant` 授权应用、`DELETE .../{id}/grant/{app_id}` 撤销 |
 
 ### 查询与追溯
 
@@ -100,12 +108,36 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 35 passed
 | `GET /lineage/{code}` | 指标血缘：物理表/字段 → 原子 → 派生 → 复合，支持影响分析与根因追溯 |
 | `GET /lineage/tables` | 表级血缘：物理表 → 逻辑模型 → 下游模型 → 物化表（全量） |
 | `GET /overview`、`GET /metrics` | 概览统计、元数据轻量查询 |
+| `GET /openapi/stats` | 开放 API 用量统计：总调用数/总返回行数 + 按应用、按数据集明细 |
+| `GET /openapi/logs` | 调用日志（分页）：应用、数据集、返回行数、耗时、状态、时间 |
+
+## 开放 API（下游消费面，独立挂载 `/openapi`）
+
+下游应用凭 **AppKey + AppSecret** 请求头认证（`hmac.compare_digest` 常数时间比较），仅能调用**已授权**的数据集，每次调用写入日志并可监控。适用于：BI 报表/看板配置数据源、下游系统直接查询。
+
+| 接口 | 说明 |
+|------|------|
+| `GET /openapi/v1/datasets` | 当前应用有权限的数据集列表 |
+| `GET /openapi/v1/datasets/{code}/data?page=&page_size=&start_date=&end_date=` | 数据集数据：物化表直读（分页，按 date_bucket 排序）/ 指标实时计算（支持日期覆盖） |
+
+```bash
+# 认证失败：缺头/密钥错 -> 401
+curl -s "http://127.0.0.1:8000/openapi/v1/datasets" | head -c 200
+# 未授权数据集 -> 403
+curl -s -H "X-App-Key: <appkey>" -H "X-App-Secret: <appsecret>" \
+  "http://127.0.0.1:8000/openapi/v1/datasets/ds_city_daily/data"
+# 正常调用（物化 dl_city_order_daily 后）-> 200，返回 {code,message,data:{columns,rows,total}}
+curl -s -H "X-App-Key: <appkey>" -H "X-App-Secret: <appsecret>" \
+  "http://127.0.0.1:8000/openapi/v1/datasets/ds_city_daily/data?page_size=10" | head -c 500
+```
+
+`appkey`/`appsecret` 在管理端「开放 API」页签创建应用时生成（AppSecret 仅创建/重置时明文展示一次，请妥善保管）。
 
 ## 接口约定
 
 - **Base URL**：`/api/v1`
 - **统一响应**：`{"code": 0, "message": "success", "data": ...}`
-- **错误码**：`0` 成功 / `400` 参数错误 / `404` 不存在 / `409` 冲突（编码重复、删除被引用） / `500` 服务器错误
+- **错误码**：`0` 成功 / `400` 参数错误 / `401` 认证失败（开放 API 缺头、密钥错、应用停用） / `403` 未授权（开放 API 数据集无授权） / `404` 不存在 / `409` 冲突（编码重复、删除被引用） / `500` 服务器错误
 - **分页**：`page`（从 1 起）、`page_size`（默认 20），返回 `total`
 - **指标状态**：`DRAFT / PUBLISHED / ARCHIVED`
 - **时间周期**：`1d / 7d / 30d / 90d / ytd / custom`（custom 传 start_date/end_date）
@@ -121,7 +153,9 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 35 passed
 5. **防注入**：所有表名/字段名/粒度格式走白名单校验（粒度经映射表取值，不直接进 SQL），值全部 `:param` 参数化绑定
 6. **全链路血缘**：每层定义记录引用关系（原子记物理字段、派生记原子 ID、复合记派生编码、下游模型记逻辑模型 + 物化表），查询时自动构建血缘图；表级血缘覆盖"物理表 → 逻辑模型 → 下游模型 → 物化表"
 7. **删除保护**：任何被引用的实体（主题域、过程、原子、维度、派生）删除均返回 409；下游模型删除/编辑时自动拆除对应物化表
+8. **数据集双源**：`downstream_model` 源读物化表 `dl_xxx`（高性能、未物化返回 400 提示）；`metric_query` 源实时动态 SQL 计算（口径与统一查询一致，天然零口径偏差）
+9. **开放 API 安全**：AppKey/AppSecret 请求头认证（`hmac.compare_digest` 常数时间比较防时序攻击），应用停用/密钥重置立即生效；数据集级授权（未授权 403）；表名/字段名白名单校验 + 值参数化绑定，注入回归有专门测试
 
 ## 更多文档
 
-- [需求文档 vs Dataphin 功能对照分析](docs/Dataphin对照分析.md) —— 功能/数据模型/API 逐项对照 + 差距清单（Dataphin 提供而需求未覆盖：审批流、指标版本、质量监控、调度、权限等）
+- [需求文档 vs DataMetric 功能对照分析](docs/DataMetric对照分析.md) —— 功能/数据模型/API 逐项对照 + 差距清单（DataMetric 提供而需求未覆盖：审批流、指标版本、质量监控、调度、权限等）

@@ -84,7 +84,7 @@ body {
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
-.overview { display: flex; gap: 10px; }
+.overview { display: flex; flex-wrap: wrap; gap: 10px; }
 .overview-item {
   background: var(--bg); border: 1px solid var(--border-light); border-radius: var(--radius);
   padding: 6px 14px; text-align: center; min-width: 64px;
@@ -291,6 +291,15 @@ code {
 .seg-item + .seg-item { border-left: 1px solid var(--border); }
 .seg-item:hover { color: var(--primary); }
 .seg-item.active { background: var(--primary); color: #fff; }
+
+/* ================= 开放 API ================= */
+.pre-dark {
+  background: #1e1e2e; color: #cdd6f4; border-radius: var(--radius);
+  padding: 12px 14px; font-size: 12px; line-height: 1.7;
+  overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-all;
+}
+.key-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 
 /* ================= Toast ================= */
 .toast {
