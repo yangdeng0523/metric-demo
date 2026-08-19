@@ -23,14 +23,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 
 from models import (
-    get_session, STATUS_DRAFT, STATUS_PUBLISHED,
+    get_session, engine, STATUS_DRAFT, STATUS_PUBLISHED,
     SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
-    AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel,
+    AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
 )
-from sql_generator import SQLGenerator, MetricNotFoundError, _safe_ident
+from sql_generator import SQLGenerator, MetricNotFoundError, _safe_ident, GRANULARITY_FMT
 
 AGG_FUNCTIONS = ("SUM", "COUNT", "AVG", "MAX", "MIN", "COUNT_DISTINCT")
 TIME_PERIODS = ("1d", "7d", "30d", "90d", "ytd", "custom")
@@ -184,10 +184,12 @@ class StatusIn(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    metric_code: str
+    metric_code: Optional[str] = None            # 单指标（兼容旧请求）
+    metric_codes: Optional[list] = None          # 多指标（优先）
     dim_codes: list = []
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    granularity: str = "day"                     # day/week/month 日期粒度
 
 
 # ===========================================================================
@@ -889,34 +891,51 @@ def delete_composite(metric_id: int):
 
 @router.post("/query", tags=["统一指标查询"])
 def query(body: QueryRequest):
+    codes = body.metric_codes or ([body.metric_code] if body.metric_code else None)
+    if not codes:
+        raise HTTPException(400, "必须指定指标（metric_codes 或 metric_code）")
+    if body.granularity not in GRANULARITY_FMT:
+        raise HTTPException(400, f"不支持的日期粒度: {body.granularity}")
     try:
-        meta, cols, rows, sql = gen.execute(
-            body.metric_code, body.dim_codes, body.start_date, body.end_date)
+        meta, cols, rows, sql = gen.execute_multi(
+            codes, body.dim_codes, body.start_date, body.end_date, body.granularity)
     except MetricNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    values = [r[0] for r in rows if isinstance(r[0], (int, float))]
+    # 指标值列：跳过首列 date_bucket 与维度列，其余均为指标列
+    n_dims = len(body.dim_codes)
+    value_idx = [i for i in range(1 + n_dims, len(cols))]
+    values = [r[i] for r in rows for i in value_idx
+              if isinstance(r[i], (int, float))]
     summary = {
-        "metric_name": meta["metric_name"], "metric_type": meta["type"],
-        "row_count": len(rows),
-        "total": round(sum(values), 2) if values and meta["type"] != "composite" else None,
+        "metric_names": meta["metric_names"], "metric_types": meta["metric_types"],
+        "granularity": meta["granularity"], "row_count": len(rows),
+        "total": round(sum(values), 2) if values else None,
         "avg": round(sum(values) / len(values), 2) if values else None,
     }
     return ok({"summary": summary, "columns": cols, "rows": rows, "sql": sql})
 
 
 @router.get("/sql-preview", tags=["指标查询"])
-def sql_preview(metric_code: str, dim_codes: str = "",
-                start_date: Optional[str] = None, end_date: Optional[str] = None):
+def sql_preview(metric_codes: str, dim_codes: str = "",
+                start_date: Optional[str] = None, end_date: Optional[str] = None,
+                granularity: str = "day"):
     """只生成 SQL 不执行（口径透明：任何查询可查看生成逻辑）"""
+    codes = [c for c in metric_codes.split(",") if c]
     dims = [d for d in dim_codes.split(",") if d] if dim_codes else []
+    if not codes:
+        raise HTTPException(400, "metric_codes 不能为空")
+    if granularity not in GRANULARITY_FMT:
+        raise HTTPException(400, f"不支持的日期粒度: {granularity}")
     try:
-        mtype, mname, sql, params = gen.generate(metric_code, dims, start_date, end_date)
+        mtypes, mnames, sql, params = gen.generate_multi(
+            codes, dims, start_date, end_date, granularity)
     except (MetricNotFoundError, ValueError) as e:
         raise HTTPException(400, str(e))
-    return ok({"metric_code": metric_code, "metric_name": mname, "type": mtype,
+    return ok({"metric_codes": codes, "metric_names": mnames,
+               "metric_types": mtypes, "granularity": granularity,
                "sql": sql, "params": params})
 
 
@@ -944,13 +963,21 @@ def _export_excel(cols, rows, title="指标查询结果"):
 
 
 @router.get("/query/export", tags=["指标查询"])
-def export_query(metric_code: str, dim_codes: str = "",
-                 start_date: Optional[str] = None, end_date: Optional[str] = None):
+def export_query(metric_codes: str, dim_codes: str = "",
+                 start_date: Optional[str] = None, end_date: Optional[str] = None,
+                 granularity: str = "day"):
     """导出查询结果为 Excel（.xlsx 下载）"""
+    codes = [c for c in metric_codes.split(",") if c]
     dims = [d for d in dim_codes.split(",") if d] if dim_codes else []
-    _meta, cols, rows, _sql = gen.execute(metric_code, dims, start_date, end_date)
+    if not codes:
+        raise HTTPException(400, "metric_codes 不能为空")
+    try:
+        _meta, cols, rows, _sql = gen.execute_multi(
+            codes, dims, start_date, end_date, granularity)
+    except (MetricNotFoundError, ValueError) as e:
+        raise HTTPException(400, str(e))
     buf = _export_excel(cols, rows, "指标查询")
-    filename = f"metric_{metric_code}.xlsx"
+    filename = f"metric_{codes[0]}_multi.xlsx"
     return StreamingResponse(
         buf,
         media_type=("application/vnd.openxmlformats-officedocument"
@@ -963,21 +990,7 @@ def export_query(metric_code: str, dim_codes: str = "",
 # ===========================================================================
 
 def _logical_model_sql(m: LogicalModel) -> str:
-    t = _safe_ident(m.physical_table)
-    joins = []
-    for i, j in enumerate(m.join_config or []):
-        at = _safe_ident(j.get("table", ""))
-        alias = _safe_ident(j.get("alias", f"d{i}"))
-        on = j.get("on", "")
-        if not on:
-            continue
-        joins.append(f"LEFT JOIN {at} {alias} ON {on}")
-    select_cols = ", ".join(["t.*"] + [f"{_safe_ident(j.get('alias', 'd' + str(i)))}.*"
-                                       for i, j in enumerate(m.join_config or [])])
-    sql = f"SELECT {select_cols}\nFROM {t} t"
-    if joins:
-        sql += "\n" + "\n".join(joins)
-    return sql
+    return gen.logical_model_sql(m)
 
 
 @router.post("/logical-models", tags=["逻辑模型"])
@@ -1053,6 +1066,194 @@ def delete_logical_model(model_id: int):
         s.delete(m)
         s.commit()
         return ok({"deleted": model_id})
+    finally:
+        s.close()
+
+
+# ===========================================================================
+# 5.9 下游模型管理：基于逻辑模型 + 指标集合生成指标汇总模型，支持物化
+# 定义 SQL 生成见 SQLGenerator.generate_downstream_sql（sql_generator.py）
+# ===========================================================================
+
+class DownstreamIn(BaseModel):
+    code: str
+    name: str
+    source_model_id: int
+    metrics: list
+    granularity: str = "day"
+    description: str = ""
+
+
+@router.post("/downstream-models", tags=["下游模型"])
+def create_downstream(body: DownstreamIn):
+    s = get_session()
+    try:
+        _check_code(s, DownstreamModel, body.code)
+        lm = _get_or_404(s, LogicalModel, body.source_model_id, "逻辑模型")
+        m = DownstreamModel(**body.dict())
+        try:
+            sql, params = gen.generate_downstream_sql(m, lm)
+            m.definition_sql = sql
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        s.add(m)
+        s.commit()
+        return ok({"id": m.id, "definition_sql": m.definition_sql,
+                   "params": params})
+    finally:
+        s.close()
+
+
+@router.get("/downstream-models", tags=["下游模型"])
+def list_downstream(page: int = 1, page_size: int = 20, keyword: str = ""):
+    s = get_session()
+    try:
+        q = s.query(DownstreamModel).order_by(DownstreamModel.id.desc())
+        if keyword:
+            like = f"%{keyword}%"
+            q = q.filter(or_(DownstreamModel.code.like(like),
+                             DownstreamModel.name.like(like)))
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = [{
+            "id": m.id, "code": m.code, "name": m.name,
+            "source_model_id": m.source_model_id,
+            "source_model_name": m.source_model_name,
+            "metrics": m.metrics or [], "granularity": m.granularity,
+            "materialized": bool(m.materialized),
+            "physical_table": m.physical_table, "row_count": m.row_count,
+            "description": m.description,
+        } for m in rows]
+        return ok({"total": total, "page": page, "page_size": page_size,
+                   "items": items})
+    finally:
+        s.close()
+
+
+@router.get("/downstream-models/{model_id}", tags=["下游模型"])
+def get_downstream(model_id: int):
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        return ok({
+            "id": m.id, "code": m.code, "name": m.name,
+            "source_model_id": m.source_model_id,
+            "source_model_name": m.source_model_name,
+            "metrics": m.metrics or [], "granularity": m.granularity,
+            "definition_sql": m.definition_sql,
+            "materialized": bool(m.materialized),
+            "physical_table": m.physical_table, "row_count": m.row_count,
+            "description": m.description,
+        })
+    finally:
+        s.close()
+
+
+@router.put("/downstream-models/{model_id}", tags=["下游模型"])
+def update_downstream(model_id: int, body: DownstreamIn):
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        _check_code(s, DownstreamModel, body.code, exclude_id=model_id)
+        lm = _get_or_404(s, LogicalModel, body.source_model_id, "逻辑模型")
+        for k, v in body.dict().items():
+            setattr(m, k, v)
+        try:
+            sql, _ = gen.generate_downstream_sql(m, lm)
+            m.definition_sql = sql
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        # 定义变更后旧物化表过期：落地表删除并复位状态
+        if m.materialized and m.physical_table:
+            tbl = _safe_ident(m.physical_table)
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+            m.materialized = 0
+            m.physical_table = None
+            m.row_count = None
+        s.commit()
+        return ok({"id": m.id})
+    finally:
+        s.close()
+
+
+@router.delete("/downstream-models/{model_id}", tags=["下游模型"])
+def delete_downstream(model_id: int):
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        if m.materialized and m.physical_table:
+            tbl = _safe_ident(m.physical_table)
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+        s.delete(m)
+        s.commit()
+        return ok({"deleted": model_id})
+    finally:
+        s.close()
+
+
+@router.post("/downstream-models/{model_id}/materialize", tags=["下游模型"])
+def materialize_downstream(model_id: int):
+    """物化：CREATE TABLE dl_{code} AS <定义 SQL>；重复执行 = 重建刷新（幂等）"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        try:
+            sql, params = gen.generate_downstream_sql(m)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        tbl = f"dl_{_safe_ident(m.code)}"
+        m.definition_sql = sql
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+            conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
+        n = engine.connect().execute(
+            text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+        m.materialized = 1
+        m.physical_table = tbl
+        m.row_count = n
+        s.commit()
+        return ok({"physical_table": tbl, "row_count": n})
+    finally:
+        s.close()
+
+
+@router.post("/downstream-models/{model_id}/preview", tags=["下游模型"])
+def preview_downstream(model_id: int, limit: int = 100):
+    """执行定义 SQL 预览（不落地），返回前 limit 行"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        try:
+            sql, params = gen.generate_downstream_sql(m)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        result = s.execute(text(sql), params)
+        cols = list(result.keys())
+        rows = [list(r) for r in result.fetchmany(limit)]
+        return ok({"columns": cols, "rows": rows, "row_count": len(rows)})
+    finally:
+        s.close()
+
+
+@router.get("/downstream-models/{model_id}/data", tags=["下游模型"])
+def downstream_data(model_id: int, page: int = 1, page_size: int = 100):
+    """查询物化表数据（分页）"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        if not m.materialized or not m.physical_table:
+            raise HTTPException(400, "下游模型尚未物化，请先执行物化")
+        tbl = _safe_ident(m.physical_table)
+        total = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+        rows_sql = text(
+            f"SELECT * FROM {tbl} ORDER BY date_bucket "
+            f"LIMIT {int(page_size)} OFFSET {(int(page) - 1) * int(page_size)}")
+        result = s.execute(rows_sql)
+        return ok({"total": total, "page": page, "page_size": page_size,
+                   "columns": list(result.keys()),
+                   "rows": [list(r) for r in result.fetchall()]})
     finally:
         s.close()
 
@@ -1134,6 +1335,54 @@ def _lineage_downstream(s, code: str, nodes: list, edges: list):
                               "to": f"composite:{cm.code}"})
 
 
+@router.get("/lineage/tables", tags=["血缘"])
+def lineage_tables():
+    """表级血缘（全量）：物理表 -> 逻辑模型 -> 下游模型 -> 物化表
+    逻辑模型的物理表关联由 physical_table + join_config 推导"""
+    s = get_session()
+    try:
+        nodes, edges = [], []
+        seen_tables = set()
+
+        def add_table(tbl: str):
+            if tbl and tbl not in seen_tables:
+                seen_tables.add(tbl)
+                nodes.append({"id": f"table:{tbl}", "type": "table",
+                              "label": tbl, "code": tbl})
+
+        # 指标口径涉及的物理表
+        for p in s.query(BusinessProcess).all():
+            add_table(p.physical_table)
+        for d in s.query(Dimension).all():
+            add_table(d.physical_table)
+
+        # 逻辑模型：物理表 -> 模型（含 join_config 关联表）
+        for lm in s.query(LogicalModel).all():
+            nid = f"model:{lm.code}"
+            nodes.append({"id": nid, "type": "logical_model",
+                          "label": lm.name, "code": lm.code})
+            add_table(lm.physical_table)
+            edges.append({"from": f"table:{lm.physical_table}", "to": nid})
+            for j in lm.join_config or []:
+                tbl = j.get("table", "")
+                add_table(tbl)
+                edges.append({"from": f"table:{tbl}", "to": nid})
+
+        # 下游模型：逻辑模型 -> 下游模型 -> 物化表
+        for dm in s.query(DownstreamModel).all():
+            nid = f"downstream:{dm.code}"
+            nodes.append({"id": nid, "type": "downstream_model",
+                          "label": dm.name, "code": dm.code})
+            edges.append({"from": f"model:{dm.source_model.code}", "to": nid})
+            if dm.materialized and dm.physical_table:
+                add_table(dm.physical_table)
+                edges.append({"from": nid, "to": f"table:{dm.physical_table}"})
+
+        return ok({"nodes": nodes, "edges": edges})
+    finally:
+        s.close()
+
+
 @router.get("/lineage/{code}", tags=["血缘"])
 def get_lineage(code: str):
     """全链路血缘：物理表/字段 -> 原子 -> 派生 -> 复合（影响分析 + 根因追溯）"""
@@ -1177,6 +1426,7 @@ def overview():
             "derived": s.query(DerivedMetric).count(),
             "composite": s.query(CompositeMetric).count(),
             "logical_models": s.query(LogicalModel).count(),
+            "downstream_models": s.query(DownstreamModel).count(),
         })
     finally:
         s.close()

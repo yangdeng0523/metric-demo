@@ -11,10 +11,11 @@ import random
 from models import (
     init_db, get_session, STATUS_PUBLISHED,
     SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
-    AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel,
+    AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
     DimCity, DimCategory, DimUser,
     DwdOrderDetail, DwdPayDetail, DwdRefundDetail,
 )
+from sql_generator import SQLGenerator
 
 random.seed(42)
 
@@ -151,12 +152,23 @@ def seed_metadata(s):
     s.add_all(composites)
 
     # 逻辑模型：交易宽表（订单事实表 JOIN 城市维度）
-    s.add(LogicalModel(
+    lm = LogicalModel(
         code="trade_wide_order", name="订单交易宽表", domain_id=domain.id,
         physical_table="dwd_order_detail", join_type="JOIN",
         join_config=[{"table": "dim_city", "on": "t.city_id = d0.city_id", "alias": "d0"},
                      {"table": "dim_category", "on": "t.category_id = d1.category_id", "alias": "d1"}],
-        description="订单明细 JOIN 城市/类目维度，供下游宽表查询使用"))
+        description="订单明细 JOIN 城市/类目维度，供下游宽表查询使用")
+    s.add(lm)
+    s.flush()  # 先落库获得逻辑模型 id，供下游模型引用
+
+    # 下游模型（指标汇总表，基于逻辑模型生成，未物化；可 POST .../materialize 落地）
+    # 注意：definition_sql 在 main() 提交事务后生成（SQL 生成需跨会话读取维度元数据）
+    s.add(DownstreamModel(
+        code="city_order_daily", name="城市订单日汇总", source_model_id=lm.id,
+        metrics=[{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]},
+                 {"metric_code": "order_count", "dim_codes": ["dim_city"]}],
+        granularity="day",
+        description="按城市+日汇总的订单金额/笔数 DWS 表，支持物化为 dl_city_order_daily"))
 
 
 def seed_physical(s):
@@ -216,9 +228,13 @@ def main():
         seed_metadata(s)
         seed_physical(s)
         s.commit()
+        # 提交后再生成下游模型定义 SQL（生成过程需跨会话读取维度元数据）
+        ds = s.query(DownstreamModel).filter_by(code="city_order_daily").first()
+        ds.definition_sql = SQLGenerator().generate_downstream_sql(ds)[0]
+        s.commit()
         print("种子数据完成：元数据 + 物理事实表（30 天）")
         for tbl in ["meta_atomic_metric", "meta_derived_metric", "meta_composite_metric",
-                    "meta_logical_model",
+                    "meta_logical_model", "meta_downstream_model",
                     "dwd_order_detail", "dwd_pay_detail", "dwd_refund_detail"]:
             from sqlalchemy import text
             from models import engine

@@ -180,6 +180,31 @@ class LogicalModel(Base):
         return self.domain.name if self.domain else ""
 
 
+class DownstreamModel(Base):
+    """下游模型：基于逻辑模型 + 指标集合生成的定义（指标汇总表），支持物化
+    物化语义：definition_sql -> CREATE TABLE dl_{code} AS ...（同库落地）
+    metrics: [{metric_code, dim_codes}]；granularity: day/week/month"""
+    __tablename__ = "meta_downstream_model"
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False)
+    name = Column(String(128), nullable=False)
+    source_model_id = Column(Integer, ForeignKey("meta_logical_model.id"), nullable=False)
+    metrics = Column(JSON, default=list)         # [{metric_code, dim_codes}]
+    granularity = Column(String(8), default="day")
+    definition_sql = Column(Text, default="")    # 生成的定义 SQL（不落地）
+    materialized = Column(Integer, default=0)    # 0/1 是否已物化
+    physical_table = Column(String(128))         # 物化后的物理表名 dl_{code}
+    row_count = Column(Integer)                  # 物化后行数
+    description = Column(Text, default="")
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
+    source_model = relationship("LogicalModel")
+
+    @property
+    def source_model_name(self):
+        return self.source_model.name if self.source_model else ""
+
+
 # ---------------------------------------------------------------------------
 # 物理表（模拟数据源：dwd 事实表 + dim 维度表）
 # ---------------------------------------------------------------------------

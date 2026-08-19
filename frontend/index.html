@@ -36,6 +36,8 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3L2 12l10 9 10-9-10-9z"/><circle cx="12" cy="12" r="3"/></svg>复合指标</a>
       <a class="nav-item" data-tab="models" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/></svg>逻辑模型</a>
+      <a class="nav-item" data-tab="downstreams" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10m0 0l-4-4m4 4l4-4"/><path d="M5 21h14v-6H5z"/></svg>下游模型</a>
       <a class="nav-item" data-tab="lineage" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7 6h10M6.5 8l3.5 8M17.5 8L14 16"/></svg>血缘追溯</a>
     </nav>
@@ -62,12 +64,20 @@
         <div class="card builder">
           <div class="builder-row">
             <div class="field metric-field">
-              <label>指标 <span class="tagline">原子 / 派生 / 复合，统一定义</span></label>
-              <select id="metric-select"></select>
+              <label>指标 <span class="tagline">多选：原子 / 派生 / 复合，统一查询</span></label>
+              <div class="chip-group" id="metric-chips"></div>
             </div>
             <div class="field dims-field">
-              <label>统计维度</label>
+              <label>统计维度 <span class="tagline">多选，多指标按公共维度对齐</span></label>
               <div class="chip-group" id="dim-chips"></div>
+            </div>
+            <div class="field gran-field">
+              <label>日期粒度</label>
+              <select id="granularity-select">
+                <option value="day">日</option>
+                <option value="week">周</option>
+                <option value="month">月</option>
+              </select>
             </div>
             <div class="field date-field">
               <label>日期范围 <span class="tagline">派生指标内嵌周期，仅 custom 周期需指定</span></label>
@@ -198,18 +208,36 @@
         </div>
       </section>
 
+      <!-- ================== 下游模型 ================== -->
+      <section class="tab-panel" id="tab-downstreams">
+        <div class="card">
+          <div class="card-head">
+            <h2>下游模型管理 <span class="hint-text">基于逻辑模型 + 指标集合生成 DWS 汇总表，可物化落地（dl_ 前缀）</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-downstreams" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-downstream">+ 新建下游模型</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-downstreams"></table></div>
+        </div>
+      </section>
+
       <!-- ================== 血缘追溯 ================== -->
       <section class="tab-panel" id="tab-lineage">
         <div class="card lineage-bar">
           <div class="field" style="min-width:360px">
-            <label>选择指标（任意层级，双向追溯）</label>
+            <label>选择指标（任意层级，双向追溯；表血缘无需选择）</label>
             <select id="lineage-select" style="width:100%"></select>
+          </div>
+          <div class="seg" id="lineage-view-switch">
+            <button class="seg-item active" data-view="metric">指标血缘</button>
+            <button class="seg-item" data-view="table">表血缘</button>
           </div>
         </div>
         <div class="card">
           <div class="card-head">
             <h2>全链路血缘</h2>
-            <span class="hint-text">影响分析（上游 → 下游）+ 根因追溯（下游 → 物理字段）</span>
+            <span class="hint-text">物理表 → 逻辑模型 → 下游模型 → 物化表 / 原子 → 派生 → 复合</span>
           </div>
           <div class="lineage-wrap"><div id="lineage-graph" class="lineage-graph"></div></div>
         </div>
