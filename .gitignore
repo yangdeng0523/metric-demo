@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 生成物（seed.py 重建）
+metadata.db
+
+# 系统与日志
+.DS_Store
+*.log

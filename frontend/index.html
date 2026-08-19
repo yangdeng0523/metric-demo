@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>统一指标维度管理平台 Demo</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <!-- ======================= 侧边导航 ======================= -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l5-6 4 3 6-8 3 3"/><path d="M3 21h18"/></svg>
+      </div>
+      <div>
+        <div class="brand-title">指标维度管理平台</div>
+        <div class="brand-sub">Dataphin 逻辑层 Demo</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <a class="nav-item active" data-tab="query" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>统一指标查询</a>
+      <a class="nav-item" data-tab="domains" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>主题域</a>
+      <a class="nav-item" data-tab="processes" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10m8 10V4m8 16v-8"/></svg>业务过程</a>
+      <a class="nav-item" data-tab="atomics" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/></svg>原子指标</a>
+      <a class="nav-item" data-tab="dims" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>维度管理</a>
+      <a class="nav-item" data-tab="derived" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg>派生指标</a>
+      <a class="nav-item" data-tab="composites" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3L2 12l10 9 10-9-10-9z"/><circle cx="12" cy="12" r="3"/></svg>复合指标</a>
+      <a class="nav-item" data-tab="models" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/></svg>逻辑模型</a>
+      <a class="nav-item" data-tab="lineage" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7 6h10M6.5 8l3.5 8M17.5 8L14 16"/></svg>血缘追溯</a>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="pill">元数据驱动 · 动态 SQL</span>
+      <p>查询时不预创建视图，由元数据实时拼装 SQL，口径全局唯一。</p>
+    </div>
+  </aside>
+
+  <!-- ======================= 主区域 ======================= -->
+  <div class="main">
+    <header class="topbar">
+      <div class="page-title">
+        <h1 id="page-title">统一指标查询</h1>
+        <p id="page-subtitle">指标名称 + 统计维度 + 时间范围 → 自动生成并执行查询，口径一致</p>
+      </div>
+      <div class="overview" id="overview"></div>
+    </header>
+
+    <div class="content">
+
+      <!-- ================== 统一指标查询 ================== -->
+      <section class="tab-panel active" id="tab-query">
+        <div class="card builder">
+          <div class="builder-row">
+            <div class="field metric-field">
+              <label>指标 <span class="tagline">原子 / 派生 / 复合，统一定义</span></label>
+              <select id="metric-select"></select>
+            </div>
+            <div class="field dims-field">
+              <label>统计维度</label>
+              <div class="chip-group" id="dim-chips"></div>
+            </div>
+            <div class="field date-field">
+              <label>日期范围 <span class="tagline">派生指标内嵌周期，仅 custom 周期需指定</span></label>
+              <div class="date-inputs">
+                <input type="date" id="start-date"><span class="date-sep">~</span><input type="date" id="end-date">
+              </div>
+            </div>
+            <button class="btn-primary" id="btn-query">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>查　询</button>
+            <button class="btn-ghost" id="btn-export" style="height:40px" title="导出查询结果为 Excel">导出 Excel</button>
+          </div>
+        </div>
+
+        <div class="summary" id="summary-cards"></div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head"><h2>可视化</h2><span class="hint-text">按维度分组展示前 12 项</span></div>
+            <div class="chart-wrap"><div id="chart" class="lineage-graph"></div></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>查询结果</h2><span class="hint-text" id="result-hint"></span></div>
+            <div class="table-wrap"><table id="result-table"></table></div>
+          </div>
+        </div>
+
+        <div class="card sql-card">
+          <div class="card-head">
+            <h2>动态生成 SQL <span class="hint-text">口径透明可审计，未预建视图</span></h2>
+            <div class="card-actions"><button class="btn-ghost" id="btn-copy-sql">复制 SQL</button></div>
+          </div>
+          <pre id="sql-preview"><code>选择指标并点击查询后，这里展示逻辑层自动生成的 SQL</code></pre>
+        </div>
+      </section>
+
+      <!-- ================== 主题域 ================== -->
+      <section class="tab-panel" id="tab-domains">
+        <div class="card">
+          <div class="card-head">
+            <h2>主题域管理 <span class="hint-text">业务领域的高层划分，组织指标与维度</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-domains" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-domain">+ 新建主题域</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-domains"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 业务过程 ================== -->
+      <section class="tab-panel" id="tab-processes">
+        <div class="card">
+          <div class="card-head">
+            <h2>业务过程管理 <span class="hint-text">不可拆分的企业事件，指标定义的基础</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-processes" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-process">+ 新建业务过程</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-processes"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 原子指标 ================== -->
+      <section class="tab-panel" id="tab-atomics">
+        <div class="card">
+          <div class="card-head">
+            <h2>原子指标管理 <span class="hint-text">业务过程 + 聚合方式 + 物理字段，不可再拆分</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-atomics" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-atomic">+ 新建原子指标</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-atomics"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 维度管理 ================== -->
+      <section class="tab-panel" id="tab-dims">
+        <div class="card">
+          <div class="card-head">
+            <h2>维度管理 <span class="hint-text">观察和分析数据的角度，含维度属性统一定义</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-dims" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-dim">+ 新建维度</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-dims"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 派生指标 ================== -->
+      <section class="tab-panel" id="tab-derived">
+        <div class="card">
+          <div class="card-head">
+            <h2>派生指标管理 <span class="hint-text">原子指标 + 时间周期 + 统计粒度 + 业务限定（修饰词）</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-derived" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-derived">+ 新建派生指标</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-derived"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 复合指标 ================== -->
+      <section class="tab-panel" id="tab-composites">
+        <div class="card">
+          <div class="card-head">
+            <h2>复合指标管理 <span class="hint-text">基于派生指标的四则运算，如客单价 = 支付金额 ÷ 支付笔数</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-composites" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-composite">+ 新建复合指标</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-composites"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 逻辑模型 ================== -->
+      <section class="tab-panel" id="tab-models">
+        <div class="card">
+          <div class="card-head">
+            <h2>逻辑模型管理 <span class="hint-text">物理表 → 逻辑模型，屏蔽底层表结构差异（P1）</span></h2>
+            <div class="card-actions"><button class="btn-primary" id="btn-new-model">+ 新建逻辑模型</button></div>
+          </div>
+          <div class="table-wrap"><table id="tbl-models"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 血缘追溯 ================== -->
+      <section class="tab-panel" id="tab-lineage">
+        <div class="card lineage-bar">
+          <div class="field" style="min-width:360px">
+            <label>选择指标（任意层级，双向追溯）</label>
+            <select id="lineage-select" style="width:100%"></select>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>全链路血缘</h2>
+            <span class="hint-text">影响分析（上游 → 下游）+ 根因追溯（下游 → 物理字段）</span>
+          </div>
+          <div class="lineage-wrap"><div id="lineage-graph" class="lineage-graph"></div></div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<!-- ================== 通用弹窗 ================== -->
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" id="modal">
+    <div class="modal-head">
+      <h2 id="modal-title">新建</h2>
+      <button class="modal-close" id="modal-close">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <div class="hint-text" id="modal-msg"></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn-ghost" id="modal-cancel">取 消</button>
+        <button class="btn-primary" id="modal-ok">保 存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
