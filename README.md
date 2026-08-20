@@ -53,7 +53,7 @@ cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 #   http://127.0.0.1:8000/docs    Swagger API 文档（自动生成）
 ```
 
-依赖（已装于 `.venv`）：`fastapi uvicorn sqlalchemy openpyxl pytest httpx`
+依赖（已装于 `.venv`）：`fastapi uvicorn sqlalchemy openpyxl pytest httpx playwright`（走查脚本用，浏览器驱动优先复用系统 Chrome）
 
 ## 测试（三层）
 
@@ -67,9 +67,20 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q
 
 覆盖：元数据 CRUD 与删除保护、SQL 生成与防注入、派生/复合指标口径、查询/导出、下游模型物化与重导、血缘追溯、权限审批/版本回滚、质量规则/健康度/告警、调度/任务实例/重试、开放 API 认证与授权。
 
-### 第二层：浏览器 E2E 走查（16 页签逐页验证）
+### 第二层：浏览器 E2E 走查（16 页签自动化脚本）
 
-本轮已用浏览器自动化（browser-use）对全部 16 个页签逐一走查：每页检查渲染完整性（关键元素 + 无 `pageErrors`）+ 核心交互冒烟。发现并修复 2 个问题：
+固化脚本 `tests/e2e/walkthrough.py`（Playwright + 系统 Chrome，无需下载浏览器）：
+
+```bash
+cd metric-demo
+.venv/bin/python tests/e2e/walkthrough.py                 # 无头走查 16 页签（默认只读）
+.venv/bin/python tests/e2e/walkthrough.py --headed        # 有头运行可观察
+.venv/bin/python tests/e2e/walkthrough.py --exec-reimport # 额外执行一次真实重导（写一条历史）
+```
+
+逐页签执行：导航 → 渲染断言（关键元素/行数/标题文本）→ 核心交互冒烟（统一指标查询多指标+日期、新建弹窗开关、审批视图切换、血缘双视图、开放 API 调用演示等）→ 收集 `pageerror`/`console.error`。16/16 通过退出码 0，任一页失败退出码 1 并列出失败点。系统无 Chrome 时先 `.venv/bin/python -m playwright install chromium`。
+
+该脚本把此前人工浏览器走查固化为可重复回归；本轮走查同时发现并修复 2 个问题：
 
 1. **批量重导任务的触发方式记录为 `auto`** —— 批量执行计划是手动确认后的用户动作，应记录 `trigger=manual`（`backend/main.py` 两处）
 2. **4 处 `window.confirm` 阻塞浏览器自动化** —— 统一替换为页面内 `confirmModal`（可自动化、不阻塞主线程），覆盖：删除确认、批量重导确认、版本回滚确认、失败任务重试确认
@@ -95,7 +106,7 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q
 | 15 | 开放 API | 应用列表 + 重置密钥 + 调用演示（返回行数/耗时）+ 调用用量统计 |
 | 16 | 血缘追溯 | 指标血缘（选指标 → 物理表/字段 → 原子 → 派生 → 复合）+ 表血缘（物理表 → 逻辑模型 → 下游模型 → 物化表） |
 
-**复跑方式**：启动服务后打开 `http://127.0.0.1:8000`，按上表逐页签操作；每页确认无控制台 JS 错误、无接口异常提示，核心交互有反馈。
+**复跑方式**：启动服务后打开 `http://127.0.0.1:8000`，按上表逐页签操作；每页确认无控制台 JS 错误、无接口异常提示，核心交互有反馈。（上表每行已由 `tests/e2e/walkthrough.py` 对应断言自动覆盖，此清单供人工抽查与扩展验证点）
 
 ## Demo 场景数据（需求文档第 7 章）
 
