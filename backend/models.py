@@ -15,7 +15,7 @@ from pathlib import Path
 
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Date, JSON, Text,
-    ForeignKey, create_engine,
+    ForeignKey, UniqueConstraint, create_engine,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
@@ -327,6 +327,125 @@ class DwdRefundDetail(Base):
     pay_id = Column(String(32))
     refund_amount = Column(Float, nullable=False)
     refund_reason = Column(String(32), default="质量原因")
+
+
+# ---------------------------------------------------------------------------
+# 治理与运维（版本 / 审批 / 标签 / 编码规范 / 质量 / 告警 / 任务 / 调度）
+# ---------------------------------------------------------------------------
+
+ENTITY_TYPES = ("atomic_metric", "derived_metric", "composite_metric", "dimension", "logical_model", "downstream_model")
+
+
+class MetricVersion(Base):
+    """指标/维度/模型版本快照：每次更新前存档，支持回滚与变更历史追溯"""
+    __tablename__ = "meta_metric_version"
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(32), nullable=False)   # atomic_metric/derived_metric/...
+    entity_id = Column(Integer, nullable=False)
+    version_no = Column(String(16), nullable=False)    # v1/v2/...
+    snapshot = Column(Text, nullable=False)            # 变更前全字段 JSON 快照
+    change_type = Column(String(16), default="update") # update/status/approve/rollback
+    change_note = Column(String(256), default="")
+    created_at = Column(DateTime, default=now)
+
+
+class Approval(Base):
+    """审批单：提交发布 → 同意/驳回（单级审批流）"""
+    __tablename__ = "meta_approval"
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(32), nullable=False)
+    entity_id = Column(Integer, nullable=False)
+    entity_code = Column(String(64), nullable=False)
+    entity_name = Column(String(128), default="")
+    action = Column(String(16), default="publish")     # publish（当前仅发布动作）
+    status = Column(String(16), default="PENDING")     # PENDING/APPROVED/REJECTED
+    comment = Column(String(512), default="")          # 审批意见
+    created_at = Column(DateTime, default=now)
+    reviewed_at = Column(DateTime)
+
+
+class QualityRule(Base):
+    """质量规则：对下游物化表执行校验（行数/波动/非空/新鲜度）"""
+    __tablename__ = "meta_quality_rule"
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(32), default="downstream_model")
+    entity_id = Column(Integer, nullable=False)        # 下游模型 id
+    rule_type = Column(String(32), nullable=False)     # row_count_min/row_count_change/non_null_rate/fresh_days
+    params = Column(JSON, default=dict)                # {min_rows, max_change_pct, column, min_rate, max_days, ...}
+    severity = Column(String(16), default="warning")   # info/warning/critical
+    enabled = Column(Integer, default=1)
+    last_check_at = Column(DateTime)
+    last_result = Column(String(16))                   # ok/fail/error
+    last_value = Column(String(64))                    # 最近一次校验结果值（如行数/波动%）
+    last_message = Column(String(256), default="")
+    created_at = Column(DateTime, default=now)
+
+
+class Alert(Base):
+    """站内告警/通知：质量失败、任务失败、审批待办等"""
+    __tablename__ = "meta_alert"
+    id = Column(Integer, primary_key=True)
+    level = Column(String(16), default="info")         # info/warning/error
+    source_type = Column(String(32), default="")       # quality/task/approval/system
+    source_id = Column(Integer)                        # 关联对象 id（规则/实例/审批单）
+    message = Column(String(512), nullable=False)
+    read = Column(Integer, default=0)
+    created_at = Column(DateTime, default=now)
+
+
+class TaskInstance(Base):
+    """任务实例：物化/重导/质量检查/调度执行的历史记录（含失败重试）"""
+    __tablename__ = "meta_task_instance"
+    id = Column(Integer, primary_key=True)
+    task_type = Column(String(32), nullable=False)     # materialize/reimport/quality_check
+    entity_type = Column(String(32), default="downstream_model")
+    entity_id = Column(Integer, nullable=False)
+    entity_code = Column(String(64), default="")
+    status = Column(String(16), default="RUNNING")     # RUNNING/SUCCESS/FAILED/SKIPPED
+    trigger = Column(String(16), default="manual")     # manual/schedule/auto
+    detail = Column(JSON, default=dict)                # 执行结果明细（deleted/inserted/rows...）
+    error = Column(Text, default="")                   # 失败原因
+    started_at = Column(DateTime, default=now)
+    finished_at = Column(DateTime)
+
+
+class Schedule(Base):
+    """周期调度：对下游模型定时物化/重导（daily 每天固定时刻 / interval 每 N 分钟）"""
+    __tablename__ = "meta_schedule"
+    id = Column(Integer, primary_key=True)
+    entity_id = Column(Integer, nullable=False)        # 下游模型 id
+    schedule_type = Column(String(16), default="daily") # daily/interval
+    hour = Column(Integer, default=2)                  # daily：每天几点（0-23）
+    minute = Column(Integer, default=0)                # daily：几分（0-59）
+    interval_minutes = Column(Integer, default=60)     # interval：间隔分钟数
+    action = Column(String(16), default="materialize") # materialize/reimport
+    enabled = Column(Integer, default=1)
+    last_run_at = Column(DateTime)
+    next_run_at = Column(DateTime)
+    created_at = Column(DateTime, default=now)
+
+
+class EntityTag(Base):
+    """实体标签：指标/维度可打任意标签，支持按标签过滤与资产检索"""
+    __tablename__ = "meta_entity_tag"
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(32), nullable=False)
+    entity_id = Column(Integer, nullable=False)
+    tag = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=now)
+    __table_args__ = (
+        # 同一实体同一标签唯一
+        UniqueConstraint("entity_type", "entity_id", "tag", name="uq_entity_tag"),
+    )
+
+
+class CodeRule(Base):
+    """编码规范：各实体类型的编码正则规则（seed 内置，创建/更新时校验）"""
+    __tablename__ = "meta_code_rule"
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(32), unique=True, nullable=False)
+    pattern = Column(String(256), nullable=False)
+    example = Column(String(128), default="")
 
 
 def init_db():

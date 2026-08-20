@@ -16,8 +16,12 @@
 import datetime as dt
 import hmac
 import io
+import json
+import re
 import secrets
+import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +37,8 @@ from models import (
     SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
     AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
     DownstreamApp, Dataset, AppDatasetGrant, ApiCallLog,
+    MetricVersion, Approval, QualityRule, Alert, TaskInstance, Schedule,
+    EntityTag, CodeRule,
 )
 from sql_generator import SQLGenerator, MetricNotFoundError, _safe_ident, GRANULARITY_FMT
 
@@ -77,7 +83,7 @@ def _check_status_arg(status: str):
 
 
 def _check_filters(s, filters: list):
-    """筛选条件（业务限定）白名单校验：字段名合法、操作符支持"""
+    """筛选条件（业务限定）白名单校验：字段名合法、操作符支持、值形态正确"""
     for f in filters or []:
         if not isinstance(f, dict) or "field" not in f or "op" not in f:
             raise HTTPException(400, f"筛选条件格式错误: {f}，需含 field/op/value")
@@ -85,12 +91,46 @@ def _check_filters(s, filters: list):
             raise HTTPException(400, f"不支持的操作符: {f['op']}")
         if not f["field"] or not str(f["field"]).replace("_", "").isalnum():
             raise HTTPException(400, f"非法字段名: {f['field']}")
+        if f["op"] in ("IN", "NOT IN"):
+            vals = f.get("value") if isinstance(f.get("value"), list) else [f.get("value")]
+            if not vals or vals == [None]:
+                raise HTTPException(400, f"{f['op']} 值不能为空")
+        elif f["op"] == "BETWEEN":
+            vals = f.get("value") if isinstance(f.get("value"), list) else [f.get("value")]
+            if not isinstance(vals, list) or len(vals) != 2:
+                raise HTTPException(400, "BETWEEN 需要两个值")
 
 
 def _check_dims(s, dim_codes: list):
     for dc in dim_codes or []:
         if not s.query(Dimension).filter_by(code=dc).first():
             raise HTTPException(400, f"维度不存在: {dc}")
+
+
+def _refs_in_downstream(s, metric_code=None, dim_code=None):
+    """下游模型 JSON 引用（无外键），返回命中的下游模型编码"""
+    hits = []
+    for dm in s.query(DownstreamModel).all():
+        for it in (dm.metrics or []):
+            if metric_code and it.get("metric_code") == metric_code:
+                hits.append(dm.code)
+                break
+            if dim_code and dim_code in (it.get("dim_codes") or []):
+                hits.append(dm.code)
+                break
+    return hits
+
+
+def _refs_in_datasets(s, metric_code=None, downstream_id=None):
+    hits = []
+    for d in s.query(Dataset).all():
+        if metric_code and metric_code in (d.metric_codes or []):
+            hits.append(d.code)
+        elif (downstream_id is not None
+              and d.source_type == "downstream_model"
+              and d.source_model_id == downstream_id):
+            hits.append(d.code)
+    return hits
 
 
 def _metric_sql(code: str, start_date=None, end_date=None):
@@ -103,6 +143,97 @@ def _metric_sql(code: str, start_date=None, end_date=None):
         mtype, _mname, sql, params = gen.generate(
             code, None, start.isoformat(), end.isoformat())
     return mtype, sql, {k: str(v) for k, v in params.items()}
+
+
+# ---------------------------------------------------------------------------
+# 治理与运维辅助：编码规范 / 版本快照 / 标签 / 告警
+# ---------------------------------------------------------------------------
+
+ENTITY_MODELS = {
+    "atomic_metric": AtomicMetric,
+    "derived_metric": DerivedMetric,
+    "composite_metric": CompositeMetric,
+    "dimension": Dimension,
+    "logical_model": LogicalModel,
+    "downstream_model": DownstreamModel,
+}
+
+
+def _check_code_rule(s, entity_type: str, code: str):
+    """编码规范校验：内置规则（seed 写入 meta_code_rule）命中时按正则校验"""
+    rule = s.query(CodeRule).filter_by(entity_type=entity_type).first()
+    if rule and rule.pattern:
+        if not re.fullmatch(rule.pattern, code or ""):
+            raise HTTPException(
+                400, f"编码不符合规范 {rule.pattern}（示例: {rule.example}）: {code}")
+
+
+def _entity_by_type(s, entity_type: str, entity_id: int):
+    model = ENTITY_MODELS.get(entity_type)
+    return s.query(model).get(entity_id) if model else None
+
+
+def _next_version_no(s, entity_type: str, entity_id: int) -> str:
+    """下一个版本号：v1/v2/...（按该实体已有版本数自增）"""
+    n = (s.query(MetricVersion).filter_by(entity_type=entity_type,
+                                          entity_id=entity_id).count()) + 1
+    return f"v{n}"
+
+
+def _entity_snapshot(obj) -> dict:
+    """实体全字段快照（JSON 可序列化：日期转 isoformat）"""
+    snap = {}
+    for c in obj.__table__.columns:
+        v = getattr(obj, c.name)
+        if isinstance(v, (dt.date, dt.datetime)):
+            v = v.isoformat()
+        snap[c.name] = v
+    return snap
+
+
+def _snapshot_version(s, entity_type: str, obj, change_type: str = "update",
+                      change_note: str = ""):
+    """变更前存档（版本快照）：实体被修改/状态变更/审批通过前调用"""
+    s.add(MetricVersion(
+        entity_type=entity_type, entity_id=obj.id,
+        version_no=_next_version_no(s, entity_type, obj.id),
+        snapshot=json.dumps(_entity_snapshot(obj), ensure_ascii=False),
+        change_type=change_type, change_note=change_note))
+
+
+def _with_tags(s, entity_type: str, entity_ids: list):
+    """批量附带标签：返回 {entity_id: [tag, ...]}（单次查询）"""
+    if not entity_ids:
+        return {}
+    rows = (s.query(EntityTag).filter_by(entity_type=entity_type)
+            .filter(EntityTag.entity_id.in_(entity_ids)).all())
+    out = {}
+    for r in rows:
+        out.setdefault(r.entity_id, []).append(r.tag)
+    return out
+
+
+def _set_tags(s, entity_type: str, entity_id: int, tags: list):
+    """全量替换实体标签（先删后插）"""
+    s.query(EntityTag).filter_by(entity_type=entity_type,
+                                 entity_id=entity_id).delete()
+    for t in tags or []:
+        t = str(t).strip()
+        if t:
+            s.add(EntityTag(entity_type=entity_type, entity_id=entity_id, tag=t))
+
+
+def _purge_entity_artifacts(s, entity_type: str, entity_id: int):
+    """删除实体时清理其治理/质量关联数据（版本、审批、标签、质量规则），
+    避免 SQLite 复用自增 id 后旧记录挂到新实体上"""
+    for model in (MetricVersion, Approval, EntityTag, QualityRule):
+        s.query(model).filter_by(entity_type=entity_type,
+                                 entity_id=entity_id).delete()
+
+
+def _new_alert(s, level: str, source_type: str, source_id, message: str):
+    s.add(Alert(level=level, source_type=source_type, source_id=source_id,
+                message=message))
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +517,7 @@ def create_atomic(body: AtomicIn):
     s = get_session()
     try:
         _check_code(s, AtomicMetric, body.code)
+        _check_code_rule(s, "atomic_metric", body.code)
         _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
         if body.agg_function not in AGG_FUNCTIONS:
             raise HTTPException(400, f"非法聚合方式: {body.agg_function}，可选 {AGG_FUNCTIONS}")
@@ -414,13 +546,14 @@ def list_atomic_metrics(process_id: Optional[int] = None, status: Optional[str] 
         total = q.count()
         rows = (q.order_by(AtomicMetric.id)
                 .offset((page - 1) * page_size).limit(page_size).all())
+        tags = _with_tags(s, "atomic_metric", [m.id for m in rows])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
             "process_id": m.process_id, "process_name": m.process_name,
             "physical_table": m.process.physical_table,
             "agg_function": m.agg_function, "physical_field": m.physical_field,
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
-            "description": m.description,
+            "description": m.description, "tags": tags.get(m.id, []),
         } for m in rows]
         return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     finally:
@@ -441,6 +574,8 @@ def get_atomic(metric_id: int):
             "agg_function": m.agg_function, "physical_field": m.physical_field,
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
             "description": m.description,
+            "tags": [t.tag for t in s.query(EntityTag)
+                     .filter_by(entity_type="atomic_metric", entity_id=m.id).all()],
             "derived_refs": [{"id": d.id, "code": d.code, "name": d.name,
                               "time_period": d.time_period} for d in derived],
         })
@@ -454,9 +589,12 @@ def update_atomic(metric_id: int, body: AtomicIn):
     try:
         m = _get_or_404(s, AtomicMetric, metric_id, "原子指标")
         _check_code(s, AtomicMetric, body.code, exclude_id=metric_id)
+        _check_code_rule(s, "atomic_metric", body.code)
         _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
         if body.agg_function not in AGG_FUNCTIONS:
             raise HTTPException(400, f"非法聚合方式: {body.agg_function}")
+        _check_status_arg(body.status)
+        _snapshot_version(s, "atomic_metric", m, "update", "编辑更新")
         for k, v in body.dict().items():
             setattr(m, k, v)
         s.commit()
@@ -474,6 +612,11 @@ def delete_atomic(metric_id: int):
         n = s.query(DerivedMetric).filter_by(atomic_id=metric_id).count()
         if n:
             raise HTTPException(409, f"原子指标 {m.name} 被 {n} 个派生指标引用，禁止删除")
+        ds = _refs_in_downstream(s, metric_code=m.code)
+        qs = _refs_in_datasets(s, metric_code=m.code)
+        if ds or qs:
+            raise HTTPException(409, f"原子指标 {m.name} 被下游模型/数据集引用，禁止删除")
+        _purge_entity_artifacts(s, "atomic_metric", metric_id)
         s.delete(m)
         s.commit()
         return ok({"deleted": metric_id})
@@ -483,11 +626,14 @@ def delete_atomic(metric_id: int):
 
 @router.post("/atomic-metrics/{metric_id}/status", tags=["原子指标"])
 def change_atomic_status(metric_id: int, body: StatusIn):
-    """发布/归档原子指标（状态变更）"""
+    """发布/归档原子指标（状态变更；发布动作建议走审批流，此处保留直切能力）"""
     s = get_session()
     try:
         m = _get_or_404(s, AtomicMetric, metric_id, "原子指标")
         _check_status_arg(body.status)
+        if m.status != body.status:
+            _snapshot_version(s, "atomic_metric", m, "status",
+                              f"状态变更: {m.status} -> {body.status}")
         m.status = body.status
         s.commit()
         return ok({"id": m.id, "code": m.code, "status": m.status})
@@ -504,6 +650,7 @@ def create_dimension(body: DimensionIn):
     s = get_session()
     try:
         _check_code(s, Dimension, body.code)
+        _check_code_rule(s, "dimension", body.code)
         _get_or_404(s, SubjectDomain, body.domain_id, "主题域")
         d = Dimension(**body.dict())
         s.add(d)
@@ -523,17 +670,21 @@ def list_dimensions(domain_id: Optional[int] = None, keyword: str = ""):
         if keyword:
             q = q.filter(or_(Dimension.code.like(f"%{keyword}%"),
                              Dimension.name.like(f"%{keyword}%")))
+        dims = q.order_by(Dimension.id).all()
+        tags = _with_tags(s, "dimension", [d.id for d in dims])
         items = [{
             "id": d.id, "code": d.code, "name": d.name,
             "domain_id": d.domain_id, "domain_name": d.domain_name,
             "physical_table": d.physical_table,
             "join_field": d.join_field, "name_field": d.name_field,
             "description": d.description,
+            "tags": [t.tag for t in s.query(EntityTag)
+                     .filter_by(entity_type="dimension", entity_id=d.id).all()],
             "attributes": [{"id": a.id, "code": a.code, "name": a.name,
                             "physical_field": a.physical_field,
                             "data_type": a.data_type}
                            for a in d.attributes],
-        } for d in q.order_by(Dimension.id).all()]
+        } for d in dims]
         return ok(items)
     finally:
         s.close()
@@ -551,6 +702,8 @@ def get_dimension(dim_id: int):
             "physical_table": d.physical_table,
             "join_field": d.join_field, "name_field": d.name_field,
             "description": d.description,
+            "tags": [t.tag for t in s.query(EntityTag)
+                     .filter_by(entity_type="dimension", entity_id=d.id).all()],
             "attributes": [{"id": a.id, "code": a.code, "name": a.name,
                             "physical_field": a.physical_field,
                             "data_type": a.data_type}
@@ -569,7 +722,9 @@ def update_dimension(dim_id: int, body: DimensionIn):
     try:
         d = _get_or_404(s, Dimension, dim_id, "维度")
         _check_code(s, Dimension, body.code, exclude_id=dim_id)
+        _check_code_rule(s, "dimension", body.code)
         _get_or_404(s, SubjectDomain, body.domain_id, "主题域")
+        _snapshot_version(s, "dimension", d, "update", "编辑更新")
         for k, v in body.dict().items():
             setattr(d, k, v)
         s.commit()
@@ -588,6 +743,10 @@ def delete_dimension(dim_id: int):
                  if d.code in (dm.dim_codes or [])]
         if using:
             raise HTTPException(409, f"维度 {d.name} 被派生指标引用: {', '.join(using)}，禁止删除")
+        ds = _refs_in_downstream(s, dim_code=d.code)
+        if ds:
+            raise HTTPException(409, f"维度 {d.name} 被下游模型引用: {', '.join(ds)}，禁止删除")
+        _purge_entity_artifacts(s, "dimension", dim_id)
         s.delete(d)
         s.commit()
         return ok({"deleted": dim_id})
@@ -647,6 +806,7 @@ def create_derived(body: DerivedIn):
     s = get_session()
     try:
         _check_code(s, DerivedMetric, body.code)
+        _check_code_rule(s, "derived_metric", body.code)
         atomic = s.query(AtomicMetric).filter_by(code=body.atomic_code).first()
         if not atomic:
             raise HTTPException(404, f"原子指标不存在: {body.atomic_code}")
@@ -679,13 +839,14 @@ def list_derived(atomic_id: Optional[int] = None, keyword: str = "",
         total = q.count()
         rows = (q.order_by(DerivedMetric.id)
                 .offset((page - 1) * page_size).limit(page_size).all())
+        tags = _with_tags(s, "derived_metric", [m.id for m in rows])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
             "atomic_id": m.atomic_id, "atomic_code": m.atomic.code,
             "atomic_name": m.atomic.name,
             "time_period": m.time_period, "dim_codes": m.dim_codes or [],
             "filters": m.filters or [], "status": m.status,
-            "description": m.description,
+            "description": m.description, "tags": tags.get(m.id, []),
         } for m in rows]
         return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     finally:
@@ -717,6 +878,8 @@ def get_derived(metric_id: int):
             "time_period": m.time_period, "dims": dims,
             "filters": m.filters or [], "status": m.status,
             "description": m.description, "composite_refs": refs,
+            "tags": [t.tag for t in s.query(EntityTag)
+                     .filter_by(entity_type="derived_metric", entity_id=m.id).all()],
             "generated_sql": sql, "sql_params": params,
         })
     finally:
@@ -742,6 +905,7 @@ def update_derived(metric_id: int, body: DerivedIn):
     try:
         m = _get_or_404(s, DerivedMetric, metric_id, "派生指标")
         _check_code(s, DerivedMetric, body.code, exclude_id=metric_id)
+        _check_code_rule(s, "derived_metric", body.code)
         atomic = s.query(AtomicMetric).filter_by(code=body.atomic_code).first()
         if not atomic:
             raise HTTPException(404, f"原子指标不存在: {body.atomic_code}")
@@ -749,6 +913,7 @@ def update_derived(metric_id: int, body: DerivedIn):
             raise HTTPException(400, f"非法时间周期: {body.time_period}")
         _check_filters(s, body.filters)
         _check_dims(s, body.dim_codes)
+        _snapshot_version(s, "derived_metric", m, "update", "编辑更新")
         m.atomic_id = atomic.id
         for k in ("code", "name", "time_period", "dim_codes", "filters",
                   "status", "description"):
@@ -769,6 +934,11 @@ def delete_derived(metric_id: int):
                  if m.code in (c.ref_codes or [])]
         if using:
             raise HTTPException(409, f"派生指标 {m.name} 被复合指标引用: {', '.join(using)}，禁止删除")
+        ds = _refs_in_downstream(s, metric_code=m.code)
+        qs = _refs_in_datasets(s, metric_code=m.code)
+        if ds or qs:
+            raise HTTPException(409, f"派生指标 {m.name} 被下游模型/数据集引用，禁止删除")
+        _purge_entity_artifacts(s, "derived_metric", metric_id)
         s.delete(m)
         s.commit()
         return ok({"deleted": metric_id})
@@ -793,6 +963,7 @@ def create_composite(body: CompositeIn):
     s = get_session()
     try:
         _check_code(s, CompositeMetric, body.code)
+        _check_code_rule(s, "composite_metric", body.code)
         _check_refs(s, body.ref_codes)
         for ref in body.ref_codes:
             if ref not in body.expression:
@@ -816,11 +987,12 @@ def list_composites(keyword: str = "", page: int = 1, page_size: int = 20):
         total = q.count()
         rows = (q.order_by(CompositeMetric.id)
                 .offset((page - 1) * page_size).limit(page_size).all())
+        tags = _with_tags(s, "composite_metric", [m.id for m in rows])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
             "expression": m.expression, "ref_codes": m.ref_codes or [],
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
-            "description": m.description,
+            "description": m.description, "tags": tags.get(m.id, []),
         } for m in rows]
         return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     finally:
@@ -847,6 +1019,8 @@ def get_composite(metric_id: int):
             "refs": refs,
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
             "description": m.description,
+            "tags": [t.tag for t in s.query(EntityTag)
+                     .filter_by(entity_type="composite_metric", entity_id=m.id).all()],
             "generated_sql": sql, "sql_params": params,
         })
     finally:
@@ -871,7 +1045,9 @@ def update_composite(metric_id: int, body: CompositeIn):
     try:
         m = _get_or_404(s, CompositeMetric, metric_id, "复合指标")
         _check_code(s, CompositeMetric, body.code, exclude_id=metric_id)
+        _check_code_rule(s, "composite_metric", body.code)
         _check_refs(s, body.ref_codes)
+        _snapshot_version(s, "composite_metric", m, "update", "编辑更新")
         for k, v in body.dict().items():
             setattr(m, k, v)
         s.commit()
@@ -885,6 +1061,10 @@ def delete_composite(metric_id: int):
     s = get_session()
     try:
         m = _get_or_404(s, CompositeMetric, metric_id, "复合指标")
+        qs = _refs_in_datasets(s, metric_code=m.code)
+        if qs:
+            raise HTTPException(409, f"复合指标 {m.name} 被数据集引用: {', '.join(qs)}，禁止删除")
+        _purge_entity_artifacts(s, "composite_metric", metric_id)
         s.delete(m)
         s.commit()
         return ok({"deleted": metric_id})
@@ -911,16 +1091,26 @@ def query(body: QueryRequest):
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # 指标值列：跳过首列 date_bucket 与维度列，其余均为指标列
+    # 按指标分别汇总，避免多指标把金额与笔数加在一起
     n_dims = len(body.dim_codes)
-    value_idx = [i for i in range(1 + n_dims, len(cols))]
-    values = [r[i] for r in rows for i in value_idx
-              if isinstance(r[i], (int, float))]
+    metric_summaries = []
+    for i, (code, name, mtype) in enumerate(
+            zip(codes, meta["metric_names"], meta["metric_types"])):
+        col_i = 1 + n_dims + i
+        values = [r[col_i] for r in rows
+                  if col_i < len(r) and isinstance(r[col_i], (int, float))]
+        metric_summaries.append({
+            "code": code, "name": name, "type": mtype,
+            "total": round(sum(values), 2) if values else None,
+            "avg": round(sum(values) / len(values), 2) if values else None,
+        })
+    only = metric_summaries[0] if len(metric_summaries) == 1 else None
     summary = {
         "metric_names": meta["metric_names"], "metric_types": meta["metric_types"],
         "granularity": meta["granularity"], "row_count": len(rows),
-        "total": round(sum(values), 2) if values else None,
-        "avg": round(sum(values) / len(values), 2) if values else None,
+        "metrics": metric_summaries,
+        "total": only["total"] if only else None,
+        "avg": only["avg"] if only else None,
     }
     return ok({"summary": summary, "columns": cols, "rows": rows, "sql": sql})
 
@@ -1005,8 +1195,13 @@ def create_logical_model(body: LogicalModelIn):
     s = get_session()
     try:
         _check_code(s, LogicalModel, body.code)
+        _check_code_rule(s, "logical_model", body.code)
         _get_or_404(s, SubjectDomain, body.domain_id, "主题域")
         m = LogicalModel(**body.dict())
+        try:
+            _logical_model_sql(m)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         s.add(m)
         s.commit()
         return ok({"id": m.id, "code": m.code})
@@ -1022,13 +1217,16 @@ def list_logical_models(keyword: str = ""):
         if keyword:
             q = q.filter(or_(LogicalModel.code.like(f"%{keyword}%"),
                              LogicalModel.name.like(f"%{keyword}%")))
+        lms = q.order_by(LogicalModel.id).all()
+        tags = _with_tags(s, "logical_model", [m.id for m in lms])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
             "domain_id": m.domain_id, "domain_name": m.domain_name,
             "physical_table": m.physical_table, "join_type": m.join_type,
             "join_config": m.join_config or [], "description": m.description,
+            "tags": tags.get(m.id, []),
             "generated_sql": _logical_model_sql(m),
-        } for m in q.order_by(LogicalModel.id).all()]
+        } for m in lms]
         return ok(items)
     finally:
         s.close()
@@ -1044,6 +1242,8 @@ def get_logical_model(model_id: int):
             "domain_id": m.domain_id, "domain_name": m.domain_name,
             "physical_table": m.physical_table, "join_type": m.join_type,
             "join_config": m.join_config or [], "description": m.description,
+            "tags": [t.tag for t in s.query(EntityTag)
+                     .filter_by(entity_type="logical_model", entity_id=m.id).all()],
             "generated_sql": _logical_model_sql(m),
         })
     finally:
@@ -1056,9 +1256,15 @@ def update_logical_model(model_id: int, body: LogicalModelIn):
     try:
         m = _get_or_404(s, LogicalModel, model_id, "逻辑模型")
         _check_code(s, LogicalModel, body.code, exclude_id=model_id)
+        _check_code_rule(s, "logical_model", body.code)
         _get_or_404(s, SubjectDomain, body.domain_id, "主题域")
+        _snapshot_version(s, "logical_model", m, "update", "编辑更新")
         for k, v in body.dict().items():
             setattr(m, k, v)
+        try:
+            _logical_model_sql(m)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         s.commit()
         return ok({"id": m.id})
     finally:
@@ -1070,6 +1276,10 @@ def delete_logical_model(model_id: int):
     s = get_session()
     try:
         m = _get_or_404(s, LogicalModel, model_id, "逻辑模型")
+        n = s.query(DownstreamModel).filter_by(source_model_id=model_id).count()
+        if n:
+            raise HTTPException(409, f"逻辑模型 {m.name} 被 {n} 个下游模型引用，禁止删除")
+        _purge_entity_artifacts(s, "logical_model", model_id)
         s.delete(m)
         s.commit()
         return ok({"deleted": model_id})
@@ -1189,10 +1399,15 @@ def delete_downstream(model_id: int):
     s = get_session()
     try:
         m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        qs = _refs_in_datasets(s, downstream_id=model_id)
+        if qs:
+            raise HTTPException(409, f"下游模型 {m.name} 被数据集引用: {', '.join(qs)}，禁止删除")
         if m.materialized and m.physical_table:
             tbl = _safe_ident(m.physical_table)
             with engine.begin() as conn:
                 conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+        _purge_entity_artifacts(s, "downstream_model", model_id)
+        s.query(Schedule).filter_by(entity_id=model_id).delete()
         s.delete(m)
         s.commit()
         return ok({"deleted": model_id})
@@ -1202,26 +1417,49 @@ def delete_downstream(model_id: int):
 
 @router.post("/downstream-models/{model_id}/materialize", tags=["下游模型"])
 def materialize_downstream(model_id: int):
-    """物化：CREATE TABLE dl_{code} AS <定义 SQL>；重复执行 = 重建刷新（幂等）"""
+    """物化：CREATE TABLE dl_{code} AS <定义 SQL>；重复执行 = 重建刷新（幂等）。
+    记录任务实例，成功后自动跑该模型全部启用质量规则（trigger=auto）"""
     s = get_session()
     try:
         m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        m_id, m_code = m.id, m.code
+        inst = TaskInstance(task_type="materialize", entity_type="downstream_model",
+                            entity_id=m_id, entity_code=m_code,
+                            trigger="manual", status="RUNNING")
+        s.add(inst)
         try:
             sql, params = gen.generate_downstream_sql(m)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        tbl = f"dl_{_safe_ident(m.code)}"
-        m.definition_sql = sql
-        with engine.begin() as conn:
-            conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
-            conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
-        with engine.connect() as conn:
-            n = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
-        m.materialized = 1
-        m.physical_table = tbl
-        m.row_count = n
+            tbl = f"dl_{_safe_ident(m.code)}"
+            m.definition_sql = sql
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+                conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
+            with engine.connect() as conn:
+                n = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+            m.materialized = 1
+            m.physical_table = tbl
+            m.row_count = n
+            inst.status = "SUCCESS"
+            inst.detail = {"physical_table": tbl, "row_count": n}
+            inst.finished_at = dt.datetime.now()
+            _run_quality_checks(s, m_id)  # 物化成功自动质量检查
+        except Exception as e:  # noqa: BLE001 - 失败写 FAILED 实例 + 告警
+            s.rollback()
+            inst = TaskInstance(task_type="materialize", entity_type="downstream_model",
+                                entity_id=m_id, entity_code=m_code,
+                                trigger="manual", status="FAILED",
+                                error=str(e), finished_at=dt.datetime.now())
+            s.add(inst)
+            s.flush()  # 先落 id，供告警 source_id 引用
+            _new_alert(s, "error", "task", inst.id,
+                       f"物化任务失败 {m_code}: {e}")
+            s.commit()
+            if isinstance(e, ValueError):
+                raise HTTPException(400, str(e))
+            raise HTTPException(500, f"物化失败: {e}")
         s.commit()
-        return ok({"physical_table": tbl, "row_count": n})
+        return ok({"physical_table": tbl, "row_count": n,
+                   "task_instance_id": inst.id, "status": inst.status})
     finally:
         s.close()
 
@@ -1276,25 +1514,51 @@ def reimport_downstream(model_id: int, start_date: Optional[str] = None,
                         end_date: Optional[str] = None):
     """重导：上游逻辑模型指标/维度更新上线后，按时间范围重建物化表数据。
     物化表区间内先 DELETE 再按最新定义重算 INSERT（同一事务，原子）；
-    默认范围 = 近 3 个月（3 个月前当月 1 日 ~ 今天），可用参数覆盖。"""
+    默认范围 = 近 3 个月（3 个月前当月 1 日 ~ 今天），可用参数覆盖。
+    记录任务实例，成功后自动跑该模型全部启用质量规则（trigger=auto）"""
     s = get_session()
     try:
         m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
         if not m.materialized or not m.physical_table:
             raise HTTPException(400, "请先物化，再执行数据重导")
+        m_id, m_code = m.id, m.code
         start, end = _reimport_range(start_date, end_date)
         # 按模型粒度生成桶边界字符串（日/周/月），保证区间匹配 date_bucket
         fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
         sb, eb = start.strftime(fmt), end.strftime(fmt)
+        inst = TaskInstance(task_type="reimport", entity_type="downstream_model",
+                            entity_id=m_id, entity_code=m_code,
+                            trigger="manual", status="RUNNING")
+        s.add(inst)
         try:
             deleted, inserted, total = _do_reimport(s, m, sb, eb)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
+            inst.status = "SUCCESS"
+            inst.detail = {"start_date": start.isoformat(),
+                           "end_date": end.isoformat(),
+                           "deleted": deleted, "inserted": inserted,
+                           "total_rows": total}
+            inst.finished_at = dt.datetime.now()
+            _run_quality_checks(s, m_id)  # 重导成功自动质量检查
+        except Exception as e:  # noqa: BLE001 - 失败写 FAILED 实例 + 告警
+            s.rollback()
+            inst = TaskInstance(task_type="reimport", entity_type="downstream_model",
+                                entity_id=m_id, entity_code=m_code,
+                                trigger="manual", status="FAILED",
+                                error=str(e), finished_at=dt.datetime.now())
+            s.add(inst)
+            s.flush()  # 先落 id，供告警 source_id 引用
+            _new_alert(s, "error", "task", inst.id,
+                       f"重导任务失败 {m_code}: {e}")
+            s.commit()
+            if isinstance(e, ValueError):
+                raise HTTPException(400, str(e))
+            raise HTTPException(500, f"重导失败: {e}")
         s.commit()
         return ok({"physical_table": _safe_ident(m.physical_table),
                    "start_date": start.isoformat(),
                    "end_date": end.isoformat(), "deleted": deleted,
-                   "inserted": inserted, "total_rows": total})
+                   "inserted": inserted, "total_rows": total,
+                   "task_instance_id": inst.id, "status": inst.status})
     finally:
         s.close()
 
@@ -1401,7 +1665,7 @@ def list_downstream_apps(page: int = 1, page_size: int = 20, keyword: str = ""):
         for a in rows:
             items.append({
                 "id": a.id, "code": a.code, "name": a.name,
-                "appkey": a.appkey, "appsecret": a.appsecret,
+                "appkey": a.appkey,
                 "status": a.status, "description": a.description,
                 "call_count": s.query(ApiCallLog).filter_by(app_id=a.id).count(),
                 "dataset_count": s.query(AppDatasetGrant).filter_by(app_id=a.id).count(),
@@ -1423,7 +1687,7 @@ def get_downstream_app(app_id: int):
               .filter(AppDatasetGrant.app_id == a.id).all())
         return ok({
             "id": a.id, "code": a.code, "name": a.name,
-            "appkey": a.appkey, "appsecret": a.appsecret,
+            "appkey": a.appkey,
             "status": a.status, "description": a.description,
             "dataset_ids": [d.id for d in ds],
             "datasets": [{"id": d.id, "code": d.code, "name": d.name} for d in ds],
@@ -1697,7 +1961,10 @@ def _auth_app(s, request: Request):
     if not key or not secret:
         raise HTTPException(401, "缺少认证头: X-App-Key / X-App-Secret")
     app = s.query(DownstreamApp).filter_by(appkey=key).first()
-    if not app or not hmac.compare_digest(app.appsecret, secret):
+    if not app:
+        raise HTTPException(401, "认证失败: AppKey/AppSecret 不匹配")
+    stored, given = app.appsecret or "", secret or ""
+    if len(stored) != len(given) or not hmac.compare_digest(stored, given):
         raise HTTPException(401, "认证失败: AppKey/AppSecret 不匹配")
     if app.status != "ENABLED":
         raise HTTPException(401, f"应用已停用: {app.code}")
@@ -1740,6 +2007,7 @@ def openapi_dataset_data(code: str, request: Request,
     每次调用写入 ApiCallLog（行数/耗时/状态）"""
     s = get_session()
     t0 = time.time()
+    app = ds = None
     try:
         app = _auth_app(s, request)
         ds = s.query(Dataset).filter_by(code=code).first()
@@ -1773,8 +2041,15 @@ def openapi_dataset_data(code: str, request: Request,
                   int((time.time() - t0) * 1000), "success")
         s.commit()
         return ok(ret)
-    except HTTPException:
+    except HTTPException as e:
         s.rollback()
+        if app is not None and ds is not None:
+            try:
+                _log_call(s, app.id, ds.id, 0, int((time.time() - t0) * 1000),
+                          f"error:{e.status_code}")
+                s.commit()
+            except Exception:
+                s.rollback()
         raise
     finally:
         s.close()
@@ -2093,7 +2368,8 @@ class ReimportExecuteIn(BaseModel):
 
 @router.post("/reimport/plan/execute", tags=["任务重导"])
 def reimport_plan_execute(body: ReimportExecuteIn):
-    """确认执行重导计划：逐个下游模型独立事务重导（一个失败不阻断其余）"""
+    """确认执行重导计划：逐个下游模型独立事务重导（一个失败不阻断其余）；
+    每个模型写任务实例，成功后自动质量检查"""
     if not body.downstream_ids:
         raise HTTPException(400, "请至少选择一个下游模型")
     s = get_session()
@@ -2102,6 +2378,7 @@ def reimport_plan_execute(body: ReimportExecuteIn):
         results = []
         for mid in body.downstream_ids:
             m = _get_or_404(s, DownstreamModel, mid, "下游模型")
+            m_id, m_code = m.id, m.code
             if not m.materialized or not m.physical_table:
                 results.append({"id": mid, "code": m.code, "status": "skipped",
                                 "deleted": None, "inserted": None,
@@ -2109,19 +2386,1035 @@ def reimport_plan_execute(body: ReimportExecuteIn):
                 continue
             fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
             sb, eb = start.strftime(fmt), end.strftime(fmt)
+            inst = TaskInstance(task_type="reimport", entity_type="downstream_model",
+                                entity_id=m_id, entity_code=m_code,
+                                trigger="auto", status="RUNNING")
+            s.add(inst)
             try:
                 deleted, inserted, total = _do_reimport(s, m, sb, eb)
+                inst.status = "SUCCESS"
+                inst.detail = {"start_date": start.isoformat(),
+                               "end_date": end.isoformat(),
+                               "deleted": deleted, "inserted": inserted,
+                               "total_rows": total}
+                inst.finished_at = dt.datetime.now()
+                _run_quality_checks(s, m_id)  # 重导成功自动质量检查
                 s.commit()  # 每模型独立提交，失败不阻断其余
                 results.append({"id": mid, "code": m.code, "status": "ok",
                                 "deleted": deleted, "inserted": inserted,
                                 "total_rows": total, "message": None})
             except Exception as e:  # noqa: BLE001 - 单模型失败不阻断批量执行
                 s.rollback()
+                inst = TaskInstance(task_type="reimport", entity_type="downstream_model",
+                                    entity_id=m_id, entity_code=m_code,
+                                    trigger="auto", status="FAILED",
+                                    error=str(e), finished_at=dt.datetime.now())
+                s.add(inst)
+                _new_alert(s, "error", "task", inst.id,
+                           f"重导任务失败 {m_code}: {e}")
+                s.commit()
                 results.append({"id": mid, "code": m.code, "status": "error",
                                 "deleted": None, "inserted": None,
                                 "total_rows": None, "message": str(e)})
         return ok({"start_date": start.isoformat(), "end_date": end.isoformat(),
                    "results": results})
+    finally:
+        s.close()
+
+
+# ===========================================================================
+# 治理与生命周期：版本快照/回滚、审批发布流、变更影响评估、标签、编码规范
+# ===========================================================================
+
+class ApprovalIn(BaseModel):
+    entity_type: str
+    entity_id: int
+    comment: str = ""
+
+
+class ApprovalReviewIn(BaseModel):
+    comment: str = ""
+
+
+class EntityTagsIn(BaseModel):
+    entity_type: str
+    entity_id: int
+    tags: list = []
+
+
+APPROVAL_ENTITY_TYPES = ("atomic_metric", "derived_metric", "composite_metric")
+
+
+@router.get("/metric-versions", tags=["治理"])
+def list_metric_versions(entity_type: str, entity_id: int,
+                         page: int = 1, page_size: int = 20):
+    """实体版本历史：每次变更前存档的快照列表（最新在前）"""
+    s = get_session()
+    try:
+        q = (s.query(MetricVersion).filter_by(entity_type=entity_type,
+                                              entity_id=entity_id)
+             .order_by(MetricVersion.id.desc()))
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = [{
+            "id": v.id, "version_no": v.version_no,
+            "change_type": v.change_type, "change_note": v.change_note,
+            "snapshot": json.loads(v.snapshot),
+            "created_at": (v.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if v.created_at else ""),
+        } for v in rows]
+        return ok({"items": items, "total": total, "page": page,
+                   "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.post("/metric-versions/{version_id}/rollback", tags=["治理"])
+def rollback_version(version_id: int):
+    """回滚：将实体恢复至指定版本快照，并生成一条 rollback 版本记录"""
+    s = get_session()
+    try:
+        v = _get_or_404(s, MetricVersion, version_id, "版本")
+        obj = _entity_by_type(s, v.entity_type, v.entity_id)
+        if not obj:
+            raise HTTPException(404, f"实体不存在: {v.entity_type} id={v.entity_id}")
+        _snapshot_version(s, v.entity_type, obj, "rollback",
+                          f"回滚至 {v.version_no}")
+        snap = json.loads(v.snapshot)
+        for k, val in snap.items():
+            if hasattr(obj, k) and k not in ("id", "created_at", "updated_at"):
+                setattr(obj, k, val)
+        s.commit()
+        return ok({"id": v.id, "entity_type": v.entity_type,
+                   "entity_id": v.entity_id, "version_no": v.version_no})
+    finally:
+        s.close()
+
+
+@router.post("/approvals", tags=["治理"])
+def submit_approval(body: ApprovalIn):
+    """提交发布审批：DRAFT 状态的指标提交后进入审批流（同实体重复提交 409）"""
+    s = get_session()
+    try:
+        if body.entity_type not in APPROVAL_ENTITY_TYPES:
+            raise HTTPException(400, f"仅指标支持审批发布: {', '.join(APPROVAL_ENTITY_TYPES)}")
+        obj = _entity_by_type(s, body.entity_type, body.entity_id)
+        if not obj:
+            raise HTTPException(404, f"实体不存在: {body.entity_type} id={body.entity_id}")
+        if getattr(obj, "status", "") == STATUS_PUBLISHED:
+            raise HTTPException(400, f"{obj.name} 已是发布状态，无需重复提交")
+        pending = (s.query(Approval).filter_by(
+            entity_type=body.entity_type, entity_id=body.entity_id,
+            status="PENDING").first())
+        if pending:
+            raise HTTPException(409, f"存在待审批的发布申请（单号 #{pending.id}），请勿重复提交")
+        a = Approval(entity_type=body.entity_type, entity_id=body.entity_id,
+                     entity_code=obj.code, entity_name=obj.name,
+                     action="publish", status="PENDING",
+                     comment=body.comment)
+        s.add(a)
+        s.commit()
+        _new_alert(s, "info", "approval", a.id,
+                   f"待办：{obj.name}（{obj.code}）提交发布审批")
+        s.commit()
+        return ok({"id": a.id, "status": a.status})
+    finally:
+        s.close()
+
+
+@router.get("/approvals", tags=["治理"])
+def list_approvals(status: Optional[str] = None,
+                   page: int = 1, page_size: int = 20):
+    """审批单列表：status=PENDING 待办 / APPROVED+REJECTED 历史（默认全部）"""
+    s = get_session()
+    try:
+        q = s.query(Approval).order_by(Approval.id.desc())
+        if status:
+            q = q.filter_by(status=status)
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = [{
+            "id": a.id, "entity_type": a.entity_type, "entity_id": a.entity_id,
+            "entity_code": a.entity_code, "entity_name": a.entity_name,
+            "action": a.action, "status": a.status, "comment": a.comment,
+            "created_at": (a.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if a.created_at else ""),
+            "reviewed_at": (a.reviewed_at.strftime("%Y-%m-%d %H:%M:%S")
+                            if a.reviewed_at else ""),
+        } for a in rows]
+        return ok({"items": items, "total": total, "page": page,
+                   "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.post("/approvals/{approval_id}/approve", tags=["治理"])
+def approve_approval(approval_id: int, body: ApprovalReviewIn = None):
+    """同意发布：实体置 PUBLISHED + 变更前存档版本 + 写告警"""
+    s = get_session()
+    try:
+        a = _get_or_404(s, Approval, approval_id, "审批单")
+        if a.status != "PENDING":
+            raise HTTPException(409, f"审批单已处理（{a.status}），不可重复操作")
+        obj = _entity_by_type(s, a.entity_type, a.entity_id)
+        if not obj:
+            raise HTTPException(404, f"实体不存在: {a.entity_type} id={a.entity_id}")
+        _snapshot_version(s, a.entity_type, obj, "approve", "审批通过发布")
+        obj.status = STATUS_PUBLISHED
+        a.status = "APPROVED"
+        a.reviewed_at = dt.datetime.now()
+        a.comment = (body.comment if body else "") or a.comment
+        s.commit()
+        _new_alert(s, "info", "approval", a.id,
+                   f"已发布：{a.entity_name}（{a.entity_code}）审批通过上线")
+        s.commit()
+        return ok({"id": a.id, "status": a.status})
+    finally:
+        s.close()
+
+
+@router.post("/approvals/{approval_id}/reject", tags=["治理"])
+def reject_approval(approval_id: int, body: ApprovalReviewIn = None):
+    """驳回发布：实体状态不变，审批单置 REJECTED"""
+    s = get_session()
+    try:
+        a = _get_or_404(s, Approval, approval_id, "审批单")
+        if a.status != "PENDING":
+            raise HTTPException(409, f"审批单已处理（{a.status}），不可重复操作")
+        a.status = "REJECTED"
+        a.reviewed_at = dt.datetime.now()
+        a.comment = (body.comment if body else "") or a.comment
+        s.commit()
+        _new_alert(s, "warning", "approval", a.id,
+                   f"被驳回：{a.entity_name}（{a.entity_code}）发布申请未通过")
+        s.commit()
+        return ok({"id": a.id, "status": a.status})
+    finally:
+        s.close()
+
+
+@router.get("/impact-report", tags=["治理"])
+def impact_report(object_type: str, object_id: int):
+    """变更影响评估：统计对象变更波及的下游模型/派生/复合/数据集/应用 + 血缘链"""
+    s = get_session()
+    try:
+        object_node, hits = _find_impacted_downstreams(s, object_type, object_id)
+        # 派生指标引用（含间接：原子被派生用、维度被派生用）
+        derived = []
+        if object_type == "atomic_metric":
+            derived = [{"id": d.id, "code": d.code, "name": d.name}
+                       for d in s.query(DerivedMetric)
+                       .filter_by(atomic_id=object_id).all()]
+        elif object_type == "derived_metric":
+            d = s.query(DerivedMetric).filter_by(code=object_node["code"]).first()
+            if d:
+                derived = [{"id": d.id, "code": d.code, "name": d.name}]
+        elif object_type == "dimension":
+            derived = [{"id": d.id, "code": d.code, "name": d.name}
+                       for d in s.query(DerivedMetric).all()
+                       if object_node["code"] in (d.dim_codes or [])]
+        # 复合指标引用（引用上述派生指标）
+        composite = []
+        for dm in derived:
+            for c in s.query(CompositeMetric).all():
+                if dm["code"] in (c.ref_codes or []) and \
+                        c.code not in [x["code"] for x in composite]:
+                    composite.append({"id": c.id, "code": c.code, "name": c.name})
+        # 数据集 + 授权应用
+        ds_codes = set()
+        for h in hits:
+            ds_codes.update(_refs_in_datasets(s, downstream_id=h["dm"].id))
+        for d in s.query(Dataset).all():
+            if object_node["code"] in (d.metric_codes or []):
+                ds_codes.add(d.code)
+        datasets = []
+        for code in sorted(ds_codes):
+            d = s.query(Dataset).filter_by(code=code).first()
+            if not d:
+                continue
+            apps = (s.query(DownstreamApp)
+                    .join(AppDatasetGrant, AppDatasetGrant.app_id == DownstreamApp.id)
+                    .filter(AppDatasetGrant.dataset_id == d.id).all())
+            datasets.append({
+                "id": d.id, "code": d.code, "name": d.name,
+                "source_type": d.source_type,
+                "granted_apps": [{"id": a.id, "code": a.code, "name": a.name}
+                                 for a in apps],
+            })
+        apps = [a for d in datasets for a in d["granted_apps"]]
+        return ok({
+            "object": object_node,
+            "summary": {
+                "downstream_models": len(hits),
+                "derived_metrics": len(derived),
+                "composite_metrics": len(composite),
+                "datasets": len(datasets),
+                "granted_apps": len(apps),
+            },
+            "downstreams": [{
+                "id": h["dm"].id, "code": h["dm"].code, "name": h["dm"].name,
+                "source_model_code": h["dm"].source_model.code
+                if h["dm"].source_model else None,
+                "materialized": bool(h["dm"].materialized),
+                "physical_table": h["dm"].physical_table,
+                "row_count": h["dm"].row_count,
+                "chain": h["chain"],
+            } for h in hits],
+            "derived": derived, "composite": composite, "datasets": datasets,
+        })
+    finally:
+        s.close()
+
+
+@router.post("/entity-tags", tags=["治理"])
+def set_entity_tags(body: EntityTagsIn):
+    """批量设置实体标签（全量替换）"""
+    s = get_session()
+    try:
+        if body.entity_type not in ENTITY_MODELS:
+            raise HTTPException(400, f"不支持的实体类型: {body.entity_type}")
+        if not _entity_by_type(s, body.entity_type, body.entity_id):
+            raise HTTPException(404, f"实体不存在: {body.entity_type} id={body.entity_id}")
+        _set_tags(s, body.entity_type, body.entity_id, body.tags)
+        s.commit()
+        return ok({"entity_type": body.entity_type, "entity_id": body.entity_id,
+                   "tags": body.tags})
+    finally:
+        s.close()
+
+
+@router.delete("/entity-tags/{tag_id}", tags=["治理"])
+def delete_entity_tag(tag_id: int):
+    s = get_session()
+    try:
+        t = _get_or_404(s, EntityTag, tag_id, "标签")
+        s.delete(t)
+        s.commit()
+        return ok({"deleted": tag_id})
+    finally:
+        s.close()
+
+
+@router.get("/tags", tags=["治理"])
+def list_tags(keyword: str = ""):
+    """全部标签及使用计数（资产检索用）"""
+    s = get_session()
+    try:
+        q = (s.query(EntityTag.tag, func.count(EntityTag.id).label("cnt"))
+             .group_by(EntityTag.tag).order_by(func.count(EntityTag.id).desc()))
+        if keyword:
+            q = q.filter(EntityTag.tag.like(f"%{keyword}%"))
+        return ok([{"tag": tag, "count": cnt} for tag, cnt in q.all()])
+    finally:
+        s.close()
+
+
+@router.get("/tags/entities", tags=["治理"])
+def tags_entities(tag: str):
+    """按标签过滤实体：返回各类型下打该标签的实体（id/code/name）"""
+    s = get_session()
+    try:
+        rows = s.query(EntityTag).filter_by(tag=tag).all()
+        out = {t: [] for t in ENTITY_MODELS}
+        for r in rows:
+            obj = _entity_by_type(s, r.entity_type, r.entity_id)
+            if obj:
+                out[r.entity_type].append({"id": obj.id, "code": obj.code,
+                                           "name": obj.name})
+        return ok(out)
+    finally:
+        s.close()
+
+
+# ===========================================================================
+# 数据质量与监控：质量规则校验、健康度总览、站内告警
+# ===========================================================================
+
+class QualityRuleIn(BaseModel):
+    entity_id: int
+    rule_type: str
+    params: dict = {}
+    severity: str = "warning"
+    enabled: int = 1
+
+
+QUALITY_RULE_TYPES = ("row_count_min", "row_count_change", "non_null_rate", "fresh_days")
+QUALITY_SEVERITIES = ("info", "warning", "critical")
+
+
+def _parse_bucket(s):
+    """解析 date_bucket 为 date：day(YYYY-MM-DD) / month(YYYY-MM) / week(YYYY-Www)"""
+    try:
+        return dt.date.fromisoformat(str(s))
+    except ValueError:
+        pass
+    m = re.match(r"^(\d{4})-(\d{2})$", str(s))
+    if m:
+        return dt.date(int(m.group(1)), int(m.group(2)), 1)
+    m = re.match(r"^(\d{4})-W(\d{2})$", str(s))
+    if m:
+        return (dt.date(int(m.group(1)), 1, 1)
+                + dt.timedelta(weeks=int(m.group(2)) - 1))
+    return None
+
+
+def _check_quality_rule(s, rule: QualityRule):
+    """执行单条质量规则，更新 last_* 并返回 (result, value, message)；
+    result ∈ ok/fail/error，非 ok 由调用方写告警"""
+    m = s.query(DownstreamModel).get(rule.entity_id)
+    if not m:
+        rule.last_result, rule.last_message = "error", "下游模型不存在，无法校验"
+        return rule.last_result, "", rule.last_message
+    if not m.materialized or not m.physical_table:
+        rule.last_result, rule.last_message = "error", "下游模型未物化，无法校验"
+        return rule.last_result, "", rule.last_message
+    tbl = _safe_ident(m.physical_table)
+    params = rule.params or {}
+    rule_type = rule.rule_type
+    try:
+        if rule_type == "row_count_min":
+            n = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+            min_rows = int(params.get("min_rows", 0))
+            val = str(n)
+            if n >= min_rows:
+                result, msg = "ok", f"行数 {n} 达标（下限 {min_rows}）"
+            else:
+                result, msg = "fail", f"行数 {n} 低于下限 {min_rows}"
+        elif rule_type == "row_count_change":
+            n = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+            prev, val = rule.last_value, str(n)
+            if prev and prev.isdigit() and int(prev) > 0:
+                pct = abs(n - int(prev)) / int(prev) * 100
+                val = f"{pct:.1f}%"
+                max_pct = float(params.get("max_change_pct", 20))
+                if pct <= max_pct:
+                    result, msg = "ok", f"行数波动 {pct:.1f}% 在阈值 {max_pct}% 内"
+                else:
+                    result, msg = "fail", f"行数波动 {pct:.1f}% 超过阈值 {max_pct}%"
+            else:
+                result, msg = "ok", f"首次检查，记录基准行数 {n}"
+        elif rule_type == "non_null_rate":
+            col = _safe_ident(str(params.get("column", "")))
+            if not col:
+                rule.last_result, rule.last_message = "error", "non_null_rate 规则需指定校验列 column"
+                return rule.last_result, "", rule.last_message
+            total = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+            nn = s.execute(
+                text(f"SELECT COUNT(*) FROM {tbl} WHERE {col} IS NOT NULL")).scalar()
+            rate = (nn / total * 100) if total else 100.0
+            min_rate = float(params.get("min_rate", 95))
+            val = f"{rate:.1f}%"
+            if rate >= min_rate:
+                result, msg = "ok", f"非空率 {rate:.1f}% 达标（阈值 {min_rate}%）"
+            else:
+                result, msg = "fail", f"非空率 {rate:.1f}% 低于阈值 {min_rate}%"
+        elif rule_type == "fresh_days":
+            latest = s.execute(text(f"SELECT MAX(date_bucket) FROM {tbl}")).scalar()
+            if latest is None:
+                result, val, msg = "fail", "无数据", "物化表无数据，新鲜度不满足"
+            else:
+                ld = _parse_bucket(latest)
+                days = (dt.date.today() - ld).days if ld else 9999
+                max_days = int(params.get("max_days", 7))
+                val = f"{days}d"
+                if days <= max_days:
+                    result, msg = "ok", f"最新数据距今 {days} 天达标（阈值 {max_days} 天）"
+                else:
+                    result, msg = "fail", f"最新数据距今 {days} 天超过阈值 {max_days} 天"
+        else:
+            rule.last_result, rule.last_message = "error", f"未知规则类型: {rule_type}"
+            return rule.last_result, "", rule.last_message
+    except Exception as e:  # noqa: BLE001 - 校验执行异常按 error 处理
+        rule.last_result, rule.last_message = "error", f"校验执行异常: {e}"
+        return rule.last_result, "", rule.last_message
+    rule.last_result = result
+    rule.last_value = val
+    rule.last_message = msg
+    rule.last_check_at = dt.datetime.now()
+    return result, val, msg
+
+
+def _check_with_instance(s, rule: QualityRule, trigger: str = "manual"):
+    """执行规则并记录任务实例（trigger=manual/auto），失败写告警"""
+    m = s.query(DownstreamModel).get(rule.entity_id)
+    inst = TaskInstance(task_type="quality_check", entity_type="downstream_model",
+                        entity_id=rule.entity_id,
+                        entity_code=m.code if m else "",
+                        trigger=trigger, status="RUNNING")
+    s.add(inst)
+    result, val, msg = _check_quality_rule(s, rule)
+    inst.status = "SUCCESS" if result == "ok" else "FAILED"
+    inst.detail = {"rule_id": rule.id, "rule_type": rule.rule_type,
+                   "result": result, "value": val}
+    inst.error = "" if result == "ok" else msg
+    inst.finished_at = dt.datetime.now()
+    if result != "ok":
+        _new_alert(s, "error" if result == "error" else "warning",
+                   "quality", rule.id,
+                   f"质量规则告警 [{rule.rule_type}] "
+                   f"{m.code if m else rule.entity_id}: {msg}")
+    return result, val, msg
+
+
+def _run_quality_checks(s, entity_id: int):
+    """物化/重导/调度成功后自动校验该下游模型全部启用规则（trigger=auto）"""
+    for rule in s.query(QualityRule).filter_by(entity_id=entity_id,
+                                               enabled=1).all():
+        _check_with_instance(s, rule, trigger="auto")
+
+
+@router.post("/quality-rules", tags=["质量"])
+def create_quality_rule(body: QualityRuleIn):
+    s = get_session()
+    try:
+        if body.rule_type not in QUALITY_RULE_TYPES:
+            raise HTTPException(400, f"非法规则类型: {body.rule_type}，可选 {QUALITY_RULE_TYPES}")
+        if body.severity not in QUALITY_SEVERITIES:
+            raise HTTPException(400, f"非法严重级别: {body.severity}")
+        m = _get_or_404(s, DownstreamModel, body.entity_id, "下游模型")
+        r = QualityRule(entity_type="downstream_model", entity_id=body.entity_id,
+                        rule_type=body.rule_type, params=body.params,
+                        severity=body.severity, enabled=1 if body.enabled else 0)
+        s.add(r)
+        s.commit()
+        return ok({"id": r.id, "entity_code": m.code})
+    finally:
+        s.close()
+
+
+@router.get("/quality-rules", tags=["质量"])
+def list_quality_rules(entity_id: Optional[int] = None):
+    s = get_session()
+    try:
+        q = s.query(QualityRule).order_by(QualityRule.id.desc())
+        if entity_id:
+            q = q.filter_by(entity_id=entity_id)
+        items = []
+        for r in q.all():
+            m = s.query(DownstreamModel).get(r.entity_id)
+            items.append({
+                "id": r.id, "entity_type": r.entity_type, "entity_id": r.entity_id,
+                "entity_code": m.code if m else "",
+                "entity_name": m.name if m else "",
+                "rule_type": r.rule_type, "params": r.params or {},
+                "severity": r.severity, "enabled": bool(r.enabled),
+                "last_check_at": (r.last_check_at.strftime("%Y-%m-%d %H:%M:%S")
+                                  if r.last_check_at else ""),
+                "last_result": r.last_result, "last_value": r.last_value,
+                "last_message": r.last_message,
+            })
+        return ok({"items": items})
+    finally:
+        s.close()
+
+
+@router.put("/quality-rules/{rule_id}", tags=["质量"])
+def update_quality_rule(rule_id: int, body: QualityRuleIn):
+    s = get_session()
+    try:
+        r = _get_or_404(s, QualityRule, rule_id, "质量规则")
+        if body.rule_type not in QUALITY_RULE_TYPES:
+            raise HTTPException(400, f"非法规则类型: {body.rule_type}")
+        if body.severity not in QUALITY_SEVERITIES:
+            raise HTTPException(400, f"非法严重级别: {body.severity}")
+        _get_or_404(s, DownstreamModel, body.entity_id, "下游模型")
+        r.entity_id = body.entity_id
+        r.rule_type = body.rule_type
+        r.params = body.params
+        r.severity = body.severity
+        r.enabled = 1 if body.enabled else 0
+        s.commit()
+        return ok({"id": r.id})
+    finally:
+        s.close()
+
+
+@router.delete("/quality-rules/{rule_id}", tags=["质量"])
+def delete_quality_rule(rule_id: int):
+    s = get_session()
+    try:
+        r = _get_or_404(s, QualityRule, rule_id, "质量规则")
+        s.delete(r)
+        s.commit()
+        return ok({"deleted": rule_id})
+    finally:
+        s.close()
+
+
+@router.post("/quality-rules/{rule_id}/toggle", tags=["质量"])
+def toggle_quality_rule(rule_id: int):
+    s = get_session()
+    try:
+        r = _get_or_404(s, QualityRule, rule_id, "质量规则")
+        r.enabled = 0 if r.enabled else 1
+        s.commit()
+        return ok({"id": r.id, "enabled": bool(r.enabled)})
+    finally:
+        s.close()
+
+
+@router.post("/quality-rules/{rule_id}/check", tags=["质量"])
+def check_quality_rule(rule_id: int):
+    """手动执行质量规则校验（记录任务实例；fail/error 自动写告警）"""
+    s = get_session()
+    try:
+        r = _get_or_404(s, QualityRule, rule_id, "质量规则")
+        result, val, msg = _check_with_instance(s, r, trigger="manual")
+        s.commit()
+        return ok({"rule_id": r.id, "result": result, "value": val,
+                   "message": msg})
+    finally:
+        s.close()
+
+
+@router.get("/quality/health", tags=["质量"])
+def quality_health():
+    """健康度总览：每个下游模型的物化/行数/最新数据/新鲜度/规则结果 → 三色等级
+    green 健康 / yellow 关注（未物化、有 fail、新鲜度>3 天）/ red 告警（error、新鲜度>7 天）"""
+    s = get_session()
+    try:
+        rows = []
+        for m in s.query(DownstreamModel).order_by(DownstreamModel.id).all():
+            latest, fresh_days = None, None
+            if m.materialized and m.physical_table:
+                try:
+                    latest = s.execute(text(
+                        f"SELECT MAX(date_bucket) FROM {_safe_ident(m.physical_table)}"
+                    )).scalar()
+                    ld = _parse_bucket(latest) if latest is not None else None
+                    fresh_days = (dt.date.today() - ld).days if ld else None
+                except Exception:  # noqa: BLE001 - 物化表异常不阻断总览
+                    pass
+            rules = s.query(QualityRule).filter_by(entity_id=m.id).all()
+            failed = [r for r in rules if r.last_result == "fail"]
+            error = [r for r in rules if r.last_result == "error"]
+            if error or (fresh_days is not None and fresh_days > 7):
+                level = "red"
+            elif failed or not m.materialized or (fresh_days is not None and fresh_days > 3):
+                level = "yellow"
+            else:
+                level = "green"
+            rows.append({
+                "id": m.id, "code": m.code, "name": m.name,
+                "materialized": bool(m.materialized),
+                "physical_table": m.physical_table, "row_count": m.row_count,
+                "latest_date": str(latest) if latest is not None else None,
+                "fresh_days": fresh_days,
+                "rule_total": len(rules), "rule_failed": len(failed),
+                "rule_error": len(error), "level": level,
+            })
+        return ok({
+            "summary": {"total": len(rows),
+                        "green": sum(1 for r in rows if r["level"] == "green"),
+                        "yellow": sum(1 for r in rows if r["level"] == "yellow"),
+                        "red": sum(1 for r in rows if r["level"] == "red")},
+            "items": rows,
+        })
+    finally:
+        s.close()
+
+
+# ---- 站内告警（通知铃铛） ---------------------------------------------------
+
+@router.get("/alerts", tags=["质量"])
+def list_alerts(unread_only: Optional[bool] = None,
+                page: int = 1, page_size: int = 20):
+    s = get_session()
+    try:
+        q = s.query(Alert).order_by(Alert.id.desc())
+        if unread_only:
+            q = q.filter_by(read=0)
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = [{
+            "id": a.id, "level": a.level, "source_type": a.source_type,
+            "source_id": a.source_id, "message": a.message,
+            "read": bool(a.read),
+            "created_at": (a.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if a.created_at else ""),
+        } for a in rows]
+        return ok({"items": items, "total": total, "page": page,
+                   "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.get("/alerts/unread-count", tags=["质量"])
+def alerts_unread_count():
+    s = get_session()
+    try:
+        n = s.query(Alert).filter_by(read=0).count()
+        return ok({"unread": n})
+    finally:
+        s.close()
+
+
+@router.post("/alerts/{alert_id}/read", tags=["质量"])
+def read_alert(alert_id: int):
+    s = get_session()
+    try:
+        a = _get_or_404(s, Alert, alert_id, "告警")
+        a.read = 1
+        s.commit()
+        return ok({"id": a.id, "read": True})
+    finally:
+        s.close()
+
+
+@router.post("/alerts/read-all", tags=["质量"])
+def read_all_alerts():
+    s = get_session()
+    try:
+        n = s.query(Alert).filter_by(read=0).update({"read": 1})
+        s.commit()
+        return ok({"updated": n})
+    finally:
+        s.close()
+
+
+# ===========================================================================
+# 调度与运维：周期调度（零依赖线程调度器）、任务实例、失败重试
+# ===========================================================================
+
+class ScheduleIn(BaseModel):
+    entity_id: int
+    schedule_type: str = "daily"          # daily / interval
+    hour: int = 2                         # daily：每天几点（0-23）
+    minute: int = 0                       # daily：几分（0-59）
+    interval_minutes: int = 60            # interval：每 N 分钟
+    action: str = "materialize"           # materialize / reimport
+    enabled: int = 1
+
+
+SCHEDULE_TYPES = ("daily", "interval")
+SCHEDULE_ACTIONS = ("materialize", "reimport")
+
+
+def _calc_next_run(sch: Schedule) -> Optional[dt.datetime]:
+    """下次运行时间：daily=下一到达时刻 / interval=当前+间隔分钟"""
+    now = dt.datetime.now()
+    if sch.schedule_type == "daily":
+        nxt = now.replace(hour=sch.hour or 0, minute=sch.minute or 0,
+                          second=0, microsecond=0)
+        if nxt <= now:
+            nxt += dt.timedelta(days=1)
+        return nxt
+    if sch.schedule_type == "interval":
+        return now + dt.timedelta(minutes=sch.interval_minutes or 60)
+    return None
+
+
+def _execute_schedule_run(s, sch: Schedule, trigger: str = "schedule") -> str:
+    """执行一次调度任务（物化/重导），写任务实例；失败回滚并写 FAILED 实例 + 告警。
+    返回 "SUCCESS"/"FAILED"；成功后由调用方触发自动质量检查"""
+    m = _get_or_404(s, DownstreamModel, sch.entity_id, "下游模型")
+    m_id, m_code = m.id, m.code
+    inst = TaskInstance(task_type=sch.action, entity_type="downstream_model",
+                        entity_id=m_id, entity_code=m_code,
+                        trigger=trigger, status="RUNNING")
+    s.add(inst)
+    try:
+        if sch.action == "materialize":
+            sql, params = gen.generate_downstream_sql(m)
+            tbl = f"dl_{_safe_ident(m.code)}"
+            m.definition_sql = sql
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+                conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
+            with engine.connect() as conn:
+                n = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+            m.materialized, m.physical_table, m.row_count = 1, tbl, n
+            inst.detail = {"physical_table": tbl, "row_count": n}
+        elif sch.action == "reimport":
+            if not m.materialized or not m.physical_table:
+                raise ValueError("请先物化，再执行数据重导")
+            start, end = _reimport_range()
+            fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
+            sb, eb = start.strftime(fmt), end.strftime(fmt)
+            deleted, inserted, total = _do_reimport(s, m, sb, eb)
+            inst.detail = {"start_date": start.isoformat(),
+                           "end_date": end.isoformat(),
+                           "deleted": deleted, "inserted": inserted,
+                           "total_rows": total}
+        else:
+            raise ValueError(f"未知调度动作: {sch.action}")
+        inst.status = "SUCCESS"
+        inst.finished_at = dt.datetime.now()
+        sch.last_run_at = dt.datetime.now()
+        sch.next_run_at = _calc_next_run(sch)
+        return "SUCCESS"
+    except Exception as e:  # noqa: BLE001 - 调度失败写 FAILED 实例 + 告警
+        s.rollback()
+        inst = TaskInstance(task_type=sch.action, entity_type="downstream_model",
+                            entity_id=m_id, entity_code=m_code,
+                            trigger=trigger, status="FAILED",
+                            error=str(e), finished_at=dt.datetime.now())
+        s.add(inst)
+        s.flush()  # 先落 id，供告警 source_id 引用
+        _new_alert(s, "error", "task", inst.id,
+                   f"调度任务失败 [{sch.action}] {m_code}: {e}")
+        return "FAILED"
+
+
+def _scheduler_tick():
+    """扫描一轮：到点的启用调度执行；成功后自动质量检查"""
+    s = get_session()
+    try:
+        now = dt.datetime.now()
+        for sch in s.query(Schedule).filter_by(enabled=1).all():
+            if sch.next_run_at and sch.next_run_at > now:
+                continue
+            status = _execute_schedule_run(s, sch)
+            if status == "SUCCESS":
+                _run_quality_checks(s, sch.entity_id)
+            s.commit()
+    finally:
+        s.close()
+
+
+def _scheduler_loop(stop_event: threading.Event):
+    """调度器线程：每 30s 扫描一轮，stop_event 置位后退出"""
+    while not stop_event.is_set():
+        try:
+            _scheduler_tick()
+        except Exception as e:  # noqa: BLE001 - 单轮异常不终止线程
+            print(f"[scheduler] tick error: {e}", flush=True)
+        stop_event.wait(30)
+
+
+@router.post("/schedules", tags=["运维"])
+def create_schedule(body: ScheduleIn):
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, body.entity_id, "下游模型")
+        if body.schedule_type not in SCHEDULE_TYPES:
+            raise HTTPException(400, f"非法调度类型: {body.schedule_type}，可选 {SCHEDULE_TYPES}")
+        if body.action not in SCHEDULE_ACTIONS:
+            raise HTTPException(400, f"非法调度动作: {body.action}，可选 {SCHEDULE_ACTIONS}")
+        sch = Schedule(entity_id=body.entity_id, schedule_type=body.schedule_type,
+                       hour=body.hour, minute=body.minute,
+                       interval_minutes=body.interval_minutes, action=body.action,
+                       enabled=1 if body.enabled else 0)
+        sch.next_run_at = _calc_next_run(sch)
+        s.add(sch)
+        s.commit()
+        return ok({"id": sch.id, "entity_code": m.code,
+                   "next_run_at": (sch.next_run_at.strftime("%Y-%m-%d %H:%M:%S")
+                                   if sch.next_run_at else "")})
+    finally:
+        s.close()
+
+
+@router.get("/schedules", tags=["运维"])
+def list_schedules():
+    s = get_session()
+    try:
+        items = []
+        for sch in s.query(Schedule).order_by(Schedule.id).all():
+            m = s.query(DownstreamModel).get(sch.entity_id)
+            items.append({
+                "id": sch.id, "entity_id": sch.entity_id,
+                "entity_code": m.code if m else "",
+                "entity_name": m.name if m else "",
+                "schedule_type": sch.schedule_type, "hour": sch.hour,
+                "minute": sch.minute, "interval_minutes": sch.interval_minutes,
+                "action": sch.action, "enabled": bool(sch.enabled),
+                "last_run_at": (sch.last_run_at.strftime("%Y-%m-%d %H:%M:%S")
+                                if sch.last_run_at else ""),
+                "next_run_at": (sch.next_run_at.strftime("%Y-%m-%d %H:%M:%S")
+                                if sch.next_run_at else ""),
+            })
+        return ok({"items": items})
+    finally:
+        s.close()
+
+
+@router.put("/schedules/{schedule_id}", tags=["运维"])
+def update_schedule(schedule_id: int, body: ScheduleIn):
+    s = get_session()
+    try:
+        sch = _get_or_404(s, Schedule, schedule_id, "调度")
+        _get_or_404(s, DownstreamModel, body.entity_id, "下游模型")
+        if body.schedule_type not in SCHEDULE_TYPES:
+            raise HTTPException(400, f"非法调度类型: {body.schedule_type}")
+        if body.action not in SCHEDULE_ACTIONS:
+            raise HTTPException(400, f"非法调度动作: {body.action}")
+        sch.entity_id = body.entity_id
+        sch.schedule_type = body.schedule_type
+        sch.hour = body.hour
+        sch.minute = body.minute
+        sch.interval_minutes = body.interval_minutes
+        sch.action = body.action
+        sch.enabled = 1 if body.enabled else 0
+        sch.next_run_at = _calc_next_run(sch)
+        s.commit()
+        return ok({"id": sch.id})
+    finally:
+        s.close()
+
+
+@router.delete("/schedules/{schedule_id}", tags=["运维"])
+def delete_schedule(schedule_id: int):
+    s = get_session()
+    try:
+        sch = _get_or_404(s, Schedule, schedule_id, "调度")
+        s.delete(sch)
+        s.commit()
+        return ok({"deleted": schedule_id})
+    finally:
+        s.close()
+
+
+@router.post("/schedules/{schedule_id}/toggle", tags=["运维"])
+def toggle_schedule(schedule_id: int):
+    s = get_session()
+    try:
+        sch = _get_or_404(s, Schedule, schedule_id, "调度")
+        sch.enabled = 0 if sch.enabled else 1
+        if sch.enabled and not sch.next_run_at:
+            sch.next_run_at = _calc_next_run(sch)
+        s.commit()
+        return ok({"id": sch.id, "enabled": bool(sch.enabled)})
+    finally:
+        s.close()
+
+
+@router.post("/schedules/{schedule_id}/run", tags=["运维"])
+def run_schedule(schedule_id: int):
+    """立即执行一次调度任务（手动触发，供前端/测试使用，不依赖线程时序）；
+    成功自动跑质量检查"""
+    s = get_session()
+    try:
+        sch = _get_or_404(s, Schedule, schedule_id, "调度")
+        status = _execute_schedule_run(s, sch, trigger="manual")
+        if status == "SUCCESS":
+            _run_quality_checks(s, sch.entity_id)
+        s.commit()
+        inst = (s.query(TaskInstance)
+                .filter_by(task_type=sch.action, entity_id=sch.entity_id,
+                           trigger="manual")
+                .order_by(TaskInstance.id.desc()).first())
+        return ok({"schedule_id": sch.id, "status": status,
+                   "task_instance_id": inst.id if inst else None,
+                   "entity_code": inst.entity_code if inst else ""})
+    finally:
+        s.close()
+
+
+@router.get("/task-instances", tags=["运维"])
+def list_task_instances(task_type: Optional[str] = None,
+                        status: Optional[str] = None,
+                        page: int = 1, page_size: int = 20):
+    s = get_session()
+    try:
+        q = s.query(TaskInstance).order_by(TaskInstance.id.desc())
+        if task_type:
+            q = q.filter_by(task_type=task_type)
+        if status:
+            q = q.filter_by(status=status)
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        items = [{
+            "id": i.id, "task_type": i.task_type, "entity_type": i.entity_type,
+            "entity_id": i.entity_id, "entity_code": i.entity_code,
+            "status": i.status, "trigger": i.trigger, "detail": i.detail or {},
+            "error": i.error,
+            "started_at": (i.started_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if i.started_at else ""),
+            "finished_at": (i.finished_at.strftime("%Y-%m-%d %H:%M:%S")
+                            if i.finished_at else ""),
+        } for i in rows]
+        return ok({"items": items, "total": total, "page": page,
+                   "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.get("/task-instances/{instance_id}", tags=["运维"])
+def get_task_instance(instance_id: int):
+    s = get_session()
+    try:
+        i = _get_or_404(s, TaskInstance, instance_id, "任务实例")
+        return ok({
+            "id": i.id, "task_type": i.task_type, "entity_type": i.entity_type,
+            "entity_id": i.entity_id, "entity_code": i.entity_code,
+            "status": i.status, "trigger": i.trigger, "detail": i.detail or {},
+            "error": i.error,
+            "started_at": (i.started_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if i.started_at else ""),
+            "finished_at": (i.finished_at.strftime("%Y-%m-%d %H:%M:%S")
+                            if i.finished_at else ""),
+        })
+    finally:
+        s.close()
+
+
+@router.post("/task-instances/{instance_id}/retry", tags=["运维"])
+def retry_task_instance(instance_id: int):
+    """失败任务重试：按实例类型重放（物化重建 / 重导按原日期范围 / 质量检查重跑规则）"""
+    s = get_session()
+    try:
+        inst = _get_or_404(s, TaskInstance, instance_id, "任务实例")
+        if inst.status == "RUNNING":
+            raise HTTPException(409, "实例执行中，暂不可重试")
+        m = _get_or_404(s, DownstreamModel, inst.entity_id, "下游模型")
+        m_id, m_code = m.id, m.code
+        if inst.task_type == "quality_check":
+            rule = s.query(QualityRule).filter_by(entity_id=m_id).first()
+            if not rule:
+                raise HTTPException(400, "该实体没有质量规则，无需重试")
+            result, val, msg = _check_with_instance(s, rule, trigger="manual")
+            s.commit()
+            return ok({"status": "ok", "result": result, "value": val,
+                       "message": msg})
+        new_inst = TaskInstance(task_type=inst.task_type,
+                                entity_type="downstream_model",
+                                entity_id=m_id, entity_code=m_code,
+                                trigger="manual", status="RUNNING")
+        s.add(new_inst)
+        try:
+            if inst.task_type == "materialize":
+                sql, params = gen.generate_downstream_sql(m)
+                tbl = f"dl_{_safe_ident(m.code)}"
+                m.definition_sql = sql
+                with engine.begin() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+                    conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
+                with engine.connect() as conn:
+                    n = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+                m.materialized, m.physical_table, m.row_count = 1, tbl, n
+                new_inst.detail = {"physical_table": tbl, "row_count": n}
+            elif inst.task_type == "reimport":
+                if not m.materialized or not m.physical_table:
+                    raise ValueError("请先物化，再执行数据重导")
+                d = inst.detail or {}
+                start, end = _reimport_range(d.get("start_date"),
+                                             d.get("end_date"))
+                fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
+                sb, eb = start.strftime(fmt), end.strftime(fmt)
+                deleted, inserted, total = _do_reimport(s, m, sb, eb)
+                new_inst.detail = {"start_date": start.isoformat(),
+                                   "end_date": end.isoformat(),
+                                   "deleted": deleted, "inserted": inserted,
+                                   "total_rows": total}
+            else:
+                raise ValueError(f"未知任务类型: {inst.task_type}")
+            new_inst.status = "SUCCESS"
+            new_inst.finished_at = dt.datetime.now()
+        except Exception as e:  # noqa: BLE001 - 重试失败写 FAILED 实例 + 告警
+            s.rollback()
+            new_inst = TaskInstance(task_type=inst.task_type,
+                                    entity_type="downstream_model",
+                                    entity_id=m_id, entity_code=m_code,
+                                    trigger="manual", status="FAILED",
+                                    error=str(e), finished_at=dt.datetime.now())
+            s.add(new_inst)
+            s.flush()  # 先落 id，供告警 source_id 引用
+            _new_alert(s, "error", "task", new_inst.id,
+                       f"任务重试失败 [{inst.task_type}] {m_code}: {e}")
+        s.commit()
+        return ok({"id": new_inst.id, "status": new_inst.status,
+                   "detail": new_inst.detail, "error": new_inst.error})
     finally:
         s.close()
 
@@ -2179,7 +3472,25 @@ def list_metrics():
 # App 组装：统一响应包装 + 双前缀挂载（/api 与 /api/v1）
 # ===========================================================================
 
-app = FastAPI(title="统一指标维度管理平台 Demo", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动内置调度线程（每 30s 扫描启用的调度执行），退出时优雅停止。
+    TestClient 非上下文模式不触发，不影响测试"""
+    stop_event = threading.Event()
+    thread = threading.Thread(target=_scheduler_loop, args=(stop_event,),
+                              name="schedule-worker", daemon=True)
+    thread.start()
+    print("[scheduler] started", flush=True)
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=5)
+        print("[scheduler] stopped", flush=True)
+
+
+app = FastAPI(title="统一指标维度管理平台 Demo", version="1.0.0",
+              lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 

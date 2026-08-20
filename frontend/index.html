@@ -34,12 +34,18 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg>派生指标</a>
       <a class="nav-item" data-tab="composites" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3L2 12l10 9 10-9-10-9z"/><circle cx="12" cy="12" r="3"/></svg>复合指标</a>
+      <a class="nav-item" data-tab="approvals" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>审批中心</a>
       <a class="nav-item" data-tab="models" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/></svg>逻辑模型</a>
       <a class="nav-item" data-tab="downstreams" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10m0 0l-4-4m4 4l4-4"/><path d="M5 21h14v-6H5z"/></svg>下游模型</a>
       <a class="nav-item" data-tab="reimport" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>任务重导</a>
+      <a class="nav-item" data-tab="quality" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>质量监控</a>
+      <a class="nav-item" data-tab="ops" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>任务运维</a>
       <a class="nav-item" data-tab="datasets" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>数据集</a>
       <a class="nav-item" data-tab="openapi" href="#">
@@ -60,7 +66,19 @@
         <h1 id="page-title">统一指标查询</h1>
         <p id="page-subtitle">指标名称 + 统计维度 + 时间范围 → 自动生成并执行查询，口径一致</p>
       </div>
-      <div class="overview" id="overview"></div>
+      <div class="topbar-right">
+        <div class="overview" id="overview"></div>
+        <div class="bell-wrap">
+          <button class="bell-btn" id="btn-alerts" title="站内通知（质量告警 / 审批待办 / 任务失败）">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+            <span class="alert-badge" id="alert-badge" style="display:none">0</span>
+          </button>
+          <div class="bell-dropdown" id="alert-dropdown">
+            <div class="bell-head"><b>站内通知</b><button class="btn-ghost btn-sm" id="btn-alerts-read-all">全部已读</button></div>
+            <div id="alert-list"></div>
+          </div>
+        </div>
+      </div>
     </header>
 
     <div class="content">
@@ -203,6 +221,22 @@
         </div>
       </section>
 
+      <!-- ================== 审批中心 ================== -->
+      <section class="tab-panel" id="tab-approvals">
+        <div class="card">
+          <div class="card-head">
+            <h2>发布审批 <span class="hint-text">指标定义完成后提交发布，经审批同意后正式生效（PUBLISHED）；驳回不改变原状态</span></h2>
+            <div class="card-actions">
+              <div class="seg" id="approval-seg">
+                <button class="seg-item active" data-view="pending">待办</button>
+                <button class="seg-item" data-view="history">历史</button>
+              </div>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-approvals"></table></div>
+        </div>
+      </section>
+
       <!-- ================== 逻辑模型 ================== -->
       <section class="tab-panel" id="tab-models">
         <div class="card">
@@ -267,6 +301,47 @@
         </div>
       </section>
 
+      <!-- ================== 质量监控 ================== -->
+      <section class="tab-panel" id="tab-quality">
+        <div class="card">
+          <div class="card-head">
+            <h2>数据质量健康度 <span class="hint-text">规则失败或数据过期 → yellow/red；物化/重导/调度成功后自动执行质量检查</span></h2>
+            <div class="card-actions"><button class="btn-ghost" id="btn-health-refresh">刷新</button></div>
+          </div>
+          <div class="summary" id="health-cards"></div>
+          <div class="table-wrap"><table id="tbl-health"></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>质量规则 <span class="hint-text">行数下限 / 行数波动 / 非空率 / 新鲜度；检查失败自动生成站内告警</span></h2>
+            <div class="card-actions"><button class="btn-primary" id="btn-new-quality">+ 新建规则</button></div>
+          </div>
+          <div class="table-wrap"><table id="tbl-quality"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 任务运维 ================== -->
+      <section class="tab-panel" id="tab-ops">
+        <div class="card">
+          <div class="card-head">
+            <h2>调度配置 <span class="hint-text">按日 / 按间隔周期执行下游模型物化或重导；「立即执行」手动触发一次</span></h2>
+            <div class="card-actions"><button class="btn-primary" id="btn-new-schedule">+ 新建调度</button></div>
+          </div>
+          <div class="table-wrap"><table id="tbl-schedules"></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>任务实例 <span class="hint-text">物化 / 重导 / 质量检查 / 调度执行的运行记录，失败可重试</span></h2>
+            <div class="card-actions">
+              <select id="ti-type" class="mini-select"><option value="">全部类型</option><option value="materialize">物化</option><option value="reimport">重导</option><option value="quality_check">质量检查</option></select>
+              <select id="ti-status" class="mini-select"><option value="">全部状态</option><option value="RUNNING">运行中</option><option value="SUCCESS">成功</option><option value="FAILED">失败</option><option value="SKIPPED">跳过</option></select>
+              <button class="btn-ghost" id="btn-ti-refresh">刷新</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-task-instances"></table></div>
+        </div>
+      </section>
+
       <!-- ================== 数据集 ================== -->
       <section class="tab-panel" id="tab-datasets">
         <div class="card">
@@ -301,6 +376,8 @@
           <div class="builder-row">
             <div class="field" style="min-width:220px"><label>选择应用</label><select id="demo-app"></select></div>
             <div class="field" style="min-width:220px"><label>选择数据集</label><select id="demo-dataset"></select></div>
+            <div class="field" style="min-width:180px"><label>AppSecret <span class="tagline">创建/重置后自动填入，或手动粘贴</span></label>
+              <input type="password" id="demo-secret" placeholder="仅创建/重置时返回明文" autocomplete="off"></div>
             <div class="field" style="min-width:110px;max-width:140px"><label>每页行数</label><input type="number" id="demo-limit" value="20" min="1" max="100"></div>
             <button class="btn-primary" id="btn-demo-call" style="height:40px">调 用</button>
           </div>

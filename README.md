@@ -27,12 +27,12 @@
 ```
 metric-demo/
 ├── backend/
-│   ├── models.py         # 元数据模型（14 张表） + SQLite 引擎
+│   ├── models.py         # 元数据模型（22 张表） + SQLite 引擎
 │   ├── seed.py           # 电商 Demo 种子数据（30 天物理数据，可重复重建）
 │   ├── sql_generator.py  # 核心：元数据驱动的 SQL 动态生成器（含防注入、日期粒度、下游模型定义）
-│   └── main.py           # FastAPI 服务（/api/v1 管理端 + /openapi 下游消费端 + 静态前端）
+│   └── main.py           # FastAPI 服务（/api/v1 管理端 + /openapi 下游消费端 + 静态前端 + 调度线程）
 ├── frontend/             # 单页前端（查询/管理/血缘/下游模型/数据集/开放 API，离线可用）
-├── tests/                # pytest 单元测试（45 个用例）
+├── tests/                # pytest 单元测试（独立临时库，不污染正式数据）
 ├── docs/                 # 需求文档 vs DataMetric 对照分析
 └── metadata.db           # SQLite 数据库（seed 后生成）
 ```
@@ -49,7 +49,7 @@ cd backend && ../.venv/bin/python seed.py && cd ..
 cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 
 # 3. 浏览器访问
-#   http://127.0.0.1:8000         管理界面（12 个页签：查询/主题域/业务过程/原子/维度/派生/复合/逻辑模型/下游模型/数据集/开放 API/血缘）
+#   http://127.0.0.1:8000         管理界面（15 个页签：查询/主题域/业务过程/原子/维度/派生/复合/逻辑模型/下游模型/数据集/开放 API/血缘/审批中心/质量监控/任务运维，右上角通知铃铛）
 #   http://127.0.0.1:8000/docs    Swagger API 文档（自动生成）
 ```
 
@@ -59,7 +59,7 @@ cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 
 ```bash
 cd metric-demo
-METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 45 passed
+METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q
 # 测试使用独立临时库，不污染正式数据
 ```
 
@@ -115,6 +115,41 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 45 passed
 | `GET /openapi/stats` | 开放 API 用量统计：总调用数/总返回行数 + 按应用、按数据集明细 |
 | `GET /openapi/logs` | 调用日志（分页）：应用、数据集、返回行数、耗时、状态、时间 |
 
+### 治理与生命周期
+
+| 资源 | 接口 | 说明 |
+|------|------|------|
+| 版本 | `GET /metric-versions?entity_type=&entity_id=&page=` | 指标/维度/模型版本历史（快照 JSON + 变更类型 + 变更说明） |
+| 回滚 | `POST /metric-versions/{id}/rollback` | 按快照回滚实体字段，并生成一条 rollback 版本记录 |
+| 审批 | `POST /approvals` | 提交发布审批（原子/派生/复合指标，`{entity_type, entity_id, comment}`；重复提交 409） |
+| 审批 | `GET /approvals?status=&page=` | 审批列表（status 过滤 pending/history）；通过后实体置 `PUBLISHED` 并生成版本 + 站内告警 |
+| 审批 | `POST /approvals/{id}/approve`、`POST /approvals/{id}/reject` | 同意（带意见）/ 驳回（带意见，状态不变） |
+| 影响评估 | `GET /impact-report?object_type=&object_id=` | **变更影响评估**：任意对象（原子/派生/复合/维度/逻辑模型/下游模型）→ 反查受影响的下游模型 + 派生引用 + 复合引用 + 关联数据集与授权应用，返回统计 + 血缘 chain |
+| 标签 | `POST /entity-tags`（`{entity_type, entity_id, tags:[]}` 全量替换）、`DELETE /entity-tags/{tag_id}` | 实体打标；所有列表/详情接口附带 `tags` 字段 |
+| 标签 | `GET /tags?keyword=`、`GET /tags/entities?tag=` | 全部标签（含计数）/ 按标签反查实体 |
+| 编码规范 | 内置（seed 写入 `meta_code_rule`） | 5 类实体编码统一校验 `^[a-z][a-z0-9_]*$`，创建/更新违反即 400 |
+
+### 数据质量与监控
+
+| 资源 | 接口 | 说明 |
+|------|------|------|
+| 质量规则 | `POST/GET/PUT/DELETE /quality-rules`、`POST /quality-rules/{id}/toggle` | 下游模型质量规则：`row_count_min`（最小行数）/ `row_count_change`（较上次波动 %）/ `non_null_rate`（非空率）/ `fresh_days`（最大新鲜天数）；级别 info/warning/critical |
+| 手动检查 | `POST /quality-rules/{id}/check` | 立即执行规则校验（物化表 COUNT / 非空率 / MAX(date_bucket)）；未物化 → error；fail/error 自动写站内告警 |
+| 自动检查 | 物化 / 重导 / 调度执行成功后自动触发 | 对该模型全部启用规则自动校验（trigger=auto），结果写入规则 last_* 字段 |
+| 健康度 | `GET /quality/health` | 三色总览：每个下游模型行数/最新分区/新鲜度/规则结果 → `green`/`yellow`/`red`（error 规则或超 7 天未刷新 = red；fail/未物化或超 3 天 = yellow）+ 汇总统计 |
+| 告警 | `GET /alerts?unread_only=&page=`、`GET /alerts/unread-count` | 站内通知列表 + 未读数（右上角铃铛角标） |
+| 告警 | `POST /alerts/{id}/read`、`POST /alerts/read-all` | 单条已读 / 全部已读 |
+
+### 调度与运维
+
+| 资源 | 接口 | 说明 |
+|------|------|------|
+| 调度 | `POST/GET/PUT/DELETE /schedules`、`POST /schedules/{id}/toggle` | 下游模型周期调度：`daily`（每天 HH:MM）/ `interval`（每 N 分钟），动作 `materialize`/`reimport`，返回下次执行时间 |
+| 立即执行 | `POST /schedules/{id}/run` | 手动触发一次调度动作（不依赖线程时序，前端「立即执行」按钮） |
+| 任务实例 | `GET /task-instances?task_type=&status=&page=`、`GET /task-instances/{id}` | 任务实例记录（物化/重导/质量检查，trigger=manual/schedule/auto，含 detail JSON 与 error） |
+| 重试 | `POST /task-instances/{id}/retry` | 失败实例一键重放（按实例类型 + 参数重执行） |
+| 调度器 | 内置线程（lifespan 启动） | 每 30 秒扫描启用调度到点执行；执行写实例（trigger=schedule）+ 成功自动质量检查 + 失败写告警；零外部依赖 |
+
 ## 开放 API（下游消费面，独立挂载 `/openapi`）
 
 下游应用凭 **AppKey + AppSecret** 请求头认证（`hmac.compare_digest` 常数时间比较），仅能调用**已授权**的数据集，每次调用写入日志并可监控。适用于：BI 报表/看板配置数据源、下游系统直接查询。
@@ -135,7 +170,7 @@ curl -s -H "X-App-Key: <appkey>" -H "X-App-Secret: <appsecret>" \
   "http://127.0.0.1:8000/openapi/v1/datasets/ds_city_daily/data?page_size=10" | head -c 500
 ```
 
-`appkey`/`appsecret` 在管理端「开放 API」页签创建应用时生成（AppSecret 仅创建/重置时明文展示一次，请妥善保管）。
+`appkey`/`appsecret` 在管理端「开放 API」页签创建或重置应用时生成；**AppSecret 仅创建/重置接口返回明文**，列表与详情不再下发。请妥善保管。
 
 ## 接口约定
 
@@ -161,7 +196,13 @@ curl -s -H "X-App-Key: <appkey>" -H "X-App-Secret: <appsecret>" \
 7. **删除保护**：任何被引用的实体（主题域、过程、原子、维度、派生）删除均返回 409；下游模型删除/编辑时自动拆除对应物化表
 8. **数据集双源**：`downstream_model` 源读物化表 `dl_xxx`（高性能、未物化返回 400 提示）；`metric_query` 源实时动态 SQL 计算（口径与统一查询一致，天然零口径偏差）
 9. **开放 API 安全**：AppKey/AppSecret 请求头认证（`hmac.compare_digest` 常数时间比较防时序攻击），应用停用/密钥重置立即生效；数据集级授权（未授权 403）；表名/字段名白名单校验 + 值参数化绑定，注入回归有专门测试
+10. **版本与回滚**：原子/派生/复合/维度/逻辑模型的每次更新、状态切换、审批通过、回滚操作前自动存档 JSON 快照（version_no 自增 v1/v2…）；回滚 = 快照写回 + 生成 rollback 版本记录，全程可审计
+11. **审批发布流**：原子/派生/复合指标「提交发布」→ 待办审批（同意置 `PUBLISHED` 并写告警 / 驳回状态不变），单级审批；归档仍为直接切换
+12. **变更影响评估**：编辑保存后自动反查受影响下游模型（复用无外键编码递归匹配），弹窗展示统计（下游模型/派生引用/复合引用/数据集/授权应用）+ 血缘 chain 图，与「任务重导」影响分析同源
+13. **质量规则与健康度**：四类规则（最小行数/行数波动/非空率/新鲜度）手动或自动校验（物化/重导/调度成功后自动触发）；健康度三色（green/yellow/red）一眼总览数据可信度；fail/error 自动生成站内告警
+14. **调度零依赖**：内置线程调度器（lifespan 启动，每 30s 扫描），支持 daily/interval 周期调度下游模型物化/重导，全程落任务实例（可筛选/详情/失败重试），不引入 APScheduler/cron 外部依赖
+15. **站内告警**：审批通过、质量检查失败、任务执行失败等自动写通知，右上角铃铛实时未读角标，可单条/全部已读
 
 ## 更多文档
 
-- [需求文档 vs DataMetric 功能对照分析](docs/DataMetric对照分析.md) —— 功能/数据模型/API 逐项对照 + 差距清单（DataMetric 提供而需求未覆盖：审批流、指标版本、质量监控、调度、权限等）
+- [需求文档 vs DataMetric 功能对照分析](docs/DataMetric对照分析.md) —— 功能/数据模型/API 逐项对照 + 差距清单（DataMetric 提供而需求未覆盖：审批流、指标版本、质量监控、调度、权限等；其中审批流/版本/质量/调度已在本 Demo 以轻量方案落地，详见上文三大模块 API）

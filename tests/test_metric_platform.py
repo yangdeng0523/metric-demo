@@ -72,6 +72,7 @@ def test_composite_sql_expression(api):
     sql = d["generated_sql"]
     assert "NULLIF" in sql
     assert "CAST(" in sql
+    assert "LEFT JOIN" in sql and "UNION" in sql
     # 两个引用派生指标均生成子查询
     for ref in ("pay_amount_7d_city", "pay_count_7d_city"):
         assert ref in d["ref_codes"]
@@ -101,6 +102,9 @@ def test_refund_rate_sanity(api):
     vi = d["columns"].index("refund_rate")
     for row in d["rows"]:
         assert row[vi] is not None and 0 <= row[vi] <= 1, f"退款率异常: {row}"
+    pay = api.post("/api/v1/query", json={"metric_code": "pay_amount_7d_city",
+                                          "dim_codes": ["dim_city"]}).json()["data"]
+    assert len(d["rows"]) >= len(pay["rows"])
 
 
 # ===========================================================================
@@ -121,6 +125,8 @@ def test_query_atomic_with_dims(api):
     assert d["columns"].index("pay_amount_sum") == 2
     assert d["summary"]["granularity"] == "day"
     assert d["summary"]["metric_names"] == ["支付金额"]
+    assert d["summary"]["total"] is not None
+    assert d["summary"]["metrics"][0]["code"] == "pay_amount_sum"
     for row in d["rows"]:
         assert re.match(r"^\d{4}-\d{2}-\d{2}$", row[0])  # 日桶格式 YYYY-MM-DD
 
@@ -211,6 +217,12 @@ def test_create_derived_validation(api):
     r = api.post("/api/v1/derived-metrics", json={
         "code": "bad_filter", "name": "错误限定", "atomic_code": "pay_amount_sum",
         "time_period": "7d", "filters": [{"field": "x", "op": "HACK", "value": 1}]})
+    assert r.status_code == 400
+    # BETWEEN 必须两个值
+    r = api.post("/api/v1/derived-metrics", json={
+        "code": "bad_between", "name": "错误区间", "atomic_code": "pay_amount_sum",
+        "time_period": "7d",
+        "filters": [{"field": "pay_amount", "op": "BETWEEN", "value": [1]}]})
     assert r.status_code == 400
 
 
@@ -361,6 +373,10 @@ def test_multi_metric_alignment(api):
         assert len(row) == 5
         assert re.match(r"^\d{4}-\d{2}-\d{2}$", row[0])
         assert row[3] is not None and row[4] is not None  # 两指标均对齐非空
+    assert d["summary"]["total"] is None  # 多指标不再混加
+    assert [m["code"] for m in d["summary"]["metrics"]] == [
+        "order_amount_sum", "order_count"]
+    assert d["summary"]["metrics"][0]["total"] is not None
 
 
 def test_multi_metric_mixed_types(api):
@@ -1150,3 +1166,565 @@ def test_reimport_plan_execute_batch(api):
         api.delete(f"/api/v1/downstream-models/{m1}")
         api.delete(f"/api/v1/downstream-models/{m2}")
         api.delete(f"/api/v1/downstream-models/{m3}")
+
+
+def test_filter_not_in_and_between(api):
+    """NOT IN / BETWEEN 应生成参数化 SQL，并可查询"""
+    r = api.post("/api/v1/derived-metrics", json={
+        "code": "pay_amt_between", "name": "区间支付金额",
+        "atomic_code": "pay_amount_sum", "time_period": "7d",
+        "dim_codes": ["dim_city"],
+        "filters": [
+            {"field": "pay_channel", "op": "NOT IN", "value": ["BANK"]},
+            {"field": "pay_amount", "op": "BETWEEN", "value": [10, 99999]},
+        ]})
+    assert r.status_code == 200, r.text
+    mid = r.json()["data"]["id"]
+    sql = api.get(f"/api/v1/derived-metrics/{mid}/sql-preview").json()["data"]["sql"]
+    assert "NOT IN" in sql and "BETWEEN" in sql
+    q = api.post("/api/v1/query", json={"metric_code": "pay_amt_between",
+                                        "dim_codes": ["dim_city"]})
+    assert q.status_code == 200, q.text
+    api.delete(f"/api/v1/derived-metrics/{mid}")
+
+
+def test_join_on_injection_rejected(api):
+    r = api.post("/api/v1/logical-models", json={
+        "code": "evil_join", "name": "注入", "domain_id": 1,
+        "physical_table": "dwd_order_detail", "join_type": "JOIN",
+        "join_config": [{"table": "dim_city", "alias": "d0",
+                         "on": "t.city_id = d0.city_id; DROP TABLE dim_city"}]})
+    assert r.status_code == 400
+    assert "JOIN" in r.json()["message"]
+
+
+def test_delete_protection_logical_and_downstream(api):
+    """逻辑模型被下游引用、下游模型被数据集引用 -> 409"""
+    lm = _trade_wide_lm(api)
+    assert api.delete(f"/api/v1/logical-models/{lm['id']}").status_code == 409
+    seed_ds = [x for x in api.get("/api/v1/downstream-models",
+                                  params={"page_size": 100}).json()["data"]["items"]
+               if x["code"] == "city_order_daily"][0]
+    r = api.delete(f"/api/v1/downstream-models/{seed_ds['id']}")
+    assert r.status_code == 409
+    assert "数据集" in r.json()["message"]
+
+
+def test_app_list_hides_secret(api):
+    aid, key, secret = _mk_app(api, "oa_hide_sec")
+    items = api.get("/api/v1/downstream-apps?page_size=100").json()["data"]["items"]
+    app = [a for a in items if a["id"] == aid][0]
+    assert "appsecret" not in app
+    assert app["appkey"] == key
+    detail = api.get(f"/api/v1/downstream-apps/{aid}").json()["data"]
+    assert "appsecret" not in detail
+    api.delete(f"/api/v1/downstream-apps/{aid}")
+
+# ===================================================================
+# 治理与生命周期：版本快照/回滚、审批发布、影响评估、标签、编码规范
+# ===================================================================
+
+def test_version_snapshot_and_rollback(api):
+    """编辑原子指标前自动存档快照（v1）；回滚恢复变更前字段并生成 rollback 版本"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "ver_atom_t", "name": "版本原子", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        r = api.put(f"/api/v1/atomic-metrics/{amid}", json={
+            "code": "ver_atom_t", "name": "版本原子改", "process_id": 1,
+            "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+        assert r.status_code == 200, r.text
+        v = api.get("/api/v1/metric-versions",
+                    params={"entity_type": "atomic_metric",
+                            "entity_id": amid}).json()["data"]
+        assert v["total"] == 1 and v["items"][0]["version_no"] == "v1"
+        assert v["items"][0]["change_type"] == "update"
+        assert v["items"][0]["snapshot"]["name"] == "版本原子"   # 变更前快照
+        assert api.get(f"/api/v1/atomic-metrics/{amid}").json()["data"]["name"] == "版本原子改"
+        # 回滚：字段恢复 + 追加 rollback 版本
+        r = api.post(f"/api/v1/metric-versions/{v['items'][0]['id']}/rollback")
+        assert r.status_code == 200, r.text
+        assert api.get(f"/api/v1/atomic-metrics/{amid}").json()["data"]["name"] == "版本原子"
+        v2 = api.get("/api/v1/metric-versions",
+                     params={"entity_type": "atomic_metric",
+                             "entity_id": amid}).json()["data"]
+        assert v2["total"] == 2 and v2["items"][0]["change_type"] == "rollback"
+        assert v2["items"][0]["snapshot"]["name"] == "版本原子改"  # 回滚前状态
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_approval_submit_and_approve(api):
+    """审批流：DRAFT 提交 -> 待办可见 -> 同意后 PUBLISHED + approve 版本；不可重复操作"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "ap_atom_a", "name": "审批原子A", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        r = api.post("/api/v1/approvals", json={
+            "entity_type": "atomic_metric", "entity_id": amid, "comment": "请审核发布"})
+        assert r.status_code == 200, r.text
+        aid = r.json()["data"]["id"]
+        assert r.json()["data"]["status"] == "PENDING"
+        items = api.get("/api/v1/approvals", params={"status": "PENDING",
+                        "page_size": 100}).json()["data"]["items"]
+        assert any(x["id"] == aid and x["entity_code"] == "ap_atom_a" for x in items)
+        # 同意 -> PUBLISHED + 生成 approve 版本
+        r = api.post(f"/api/v1/approvals/{aid}/approve", json={"comment": "审核通过"})
+        assert r.status_code == 200 and r.json()["data"]["status"] == "APPROVED"
+        d = api.get(f"/api/v1/atomic-metrics/{amid}").json()["data"]
+        assert d["status"] == "PUBLISHED"
+        v = api.get("/api/v1/metric-versions",
+                    params={"entity_type": "atomic_metric",
+                            "entity_id": amid}).json()["data"]
+        assert v["total"] == 1 and v["items"][0]["change_type"] == "approve"
+        # 已发布不可再提交；已处理审批单不可重复操作；历史列表可见
+        assert api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                        "entity_id": amid}).status_code == 400
+        assert api.post(f"/api/v1/approvals/{aid}/approve").status_code == 409
+        hist = api.get("/api/v1/approvals", params={"status": "APPROVED",
+                        "page_size": 100}).json()["data"]["items"]
+        assert any(x["id"] == aid for x in hist)
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_approval_reject_keeps_status(api):
+    """驳回：实体状态不变、无新版本；驳回后不可重复操作；可重新提交"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "ap_atom_r", "name": "审批原子R", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        aid = api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                       "entity_id": amid}).json()["data"]["id"]
+        r = api.post(f"/api/v1/approvals/{aid}/reject", json={"comment": "口径需确认"})
+        assert r.status_code == 200 and r.json()["data"]["status"] == "REJECTED"
+        assert api.get(f"/api/v1/atomic-metrics/{amid}").json()["data"]["status"] == "DRAFT"
+        assert api.get("/api/v1/metric-versions", params={
+            "entity_type": "atomic_metric", "entity_id": amid}).json()["data"]["total"] == 0
+        assert api.post(f"/api/v1/approvals/{aid}/reject").status_code == 409
+        # 驳回后可重新提交
+        r = api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                     "entity_id": amid})
+        assert r.status_code == 200, r.text
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_approval_validation_errors(api):
+    """审批校验：类型不支持 400 / 实体不存在 404 / 同实体重复待办 409；派生指标可审批"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "ap_atom_v", "name": "审批原子V", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        dims = api.get("/api/v1/dimensions").json()["data"]
+        dim = (dims if isinstance(dims, list) else dims["items"])[0]
+        assert api.post("/api/v1/approvals", json={"entity_type": "dimension",
+                        "entity_id": dim["id"]}).status_code == 400
+        assert api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                        "entity_id": 999999}).status_code == 404
+        assert api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                        "entity_id": amid}).status_code == 200
+        assert api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                        "entity_id": amid}).status_code == 409
+        # 派生指标（显式 DRAFT）同样可走审批发布
+        r = api.post("/api/v1/derived-metrics", json={
+            "code": "ap_der_v", "name": "审批派生V", "atomic_code": "order_count",
+            "time_period": "7d", "dim_codes": ["dim_city"], "status": "DRAFT"})
+        dmid = r.json()["data"]["id"]
+        try:
+            r = api.post("/api/v1/approvals", json={"entity_type": "derived_metric",
+                         "entity_id": dmid})
+            assert r.status_code == 200, r.text
+            aid = r.json()["data"]["id"]
+            assert api.post(f"/api/v1/approvals/{aid}/approve").status_code == 200
+            assert api.get(f"/api/v1/derived-metrics/{dmid}").json()["data"]["status"] == "PUBLISHED"
+        finally:
+            api.delete(f"/api/v1/derived-metrics/{dmid}")
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_impact_report_counts(api):
+    """影响评估：原子 -> 派生引用 1 + 下游模型 1 + 完整血缘链，统计数字精确"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "imp_atom_t", "name": "影响原子", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        r = api.post("/api/v1/derived-metrics", json={
+            "code": "imp_der_t", "name": "影响派生", "atomic_code": "imp_atom_t",
+            "time_period": "7d", "dim_codes": ["dim_city"]})
+        dmid = r.json()["data"]["id"]
+        lm = _trade_wide_lm(api)
+        r = api.post("/api/v1/downstream-models", json={
+            "code": "imp_ds_t", "name": "影响下游", "source_model_id": lm["id"],
+            "granularity": "day",
+            "metrics": [{"metric_code": "imp_der_t", "dim_codes": ["dim_city"]}]})
+        mid = r.json()["data"]["id"]
+        try:
+            d = api.get("/api/v1/impact-report", params={
+                "object_type": "atomic_metric", "object_id": amid}).json()["data"]
+            assert d["object"]["code"] == "imp_atom_t"
+            assert d["summary"] == {"downstream_models": 1, "derived_metrics": 1,
+                                    "composite_metrics": 0, "datasets": 0,
+                                    "granted_apps": 0}
+            assert [x["code"] for x in d["derived"]] == ["imp_der_t"]
+            assert d["downstreams"][0]["code"] == "imp_ds_t"
+            assert [n["type"] for n in d["downstreams"][0]["chain"]] == \
+                ["atomic_metric", "derived_metric", "logical_model", "downstream"]
+            # 派生对象本身：直接命中 1 个下游
+            d2 = api.get("/api/v1/impact-report", params={
+                "object_type": "derived_metric", "object_id": dmid}).json()["data"]
+            assert d2["summary"]["downstream_models"] == 1
+            assert d2["summary"]["derived_metrics"] == 1
+        finally:
+            api.delete(f"/api/v1/downstream-models/{mid}")
+            api.delete(f"/api/v1/derived-metrics/{dmid}")
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_entity_tags_manage(api):
+    """实体标签：批量设置 -> 列表附带 tags -> 计数/按标签过滤 -> 删除"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "tag_atom_t", "name": "标签原子", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        r = api.post("/api/v1/entity-tags", json={
+            "entity_type": "atomic_metric", "entity_id": amid,
+            "tags": ["核心指标", "月报"]})
+        assert r.status_code == 200, r.text
+        row = [x for x in api.get("/api/v1/atomic-metrics",
+              params={"page_size": 100}).json()["data"]["items"] if x["id"] == amid][0]
+        assert set(row["tags"]) == {"核心指标", "月报"}
+        tags = api.get("/api/v1/tags").json()["data"]
+        assert any(x["tag"] == "核心指标" and x["count"] >= 1 for x in tags)
+        ent = api.get("/api/v1/tags/entities", params={"tag": "核心指标"}).json()["data"]
+        assert {"id": amid, "code": "tag_atom_t", "name": "标签原子"} in ent["atomic_metric"]
+        # 全量替换：只保留新标签
+        api.post("/api/v1/entity-tags", json={
+            "entity_type": "atomic_metric", "entity_id": amid, "tags": ["核心指标"]})
+        row = [x for x in api.get("/api/v1/atomic-metrics",
+              params={"page_size": 100}).json()["data"]["items"] if x["id"] == amid][0]
+        assert row["tags"] == ["核心指标"]
+        # 删除单个标签（tag id 无列表接口，直接查库取）
+        from models import engine
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            tag_id = conn.execute(text(
+                "SELECT id FROM meta_entity_tag "
+                "WHERE entity_type='atomic_metric' AND entity_id=:eid AND tag='核心指标'"),
+                {"eid": amid}).scalar()
+        assert tag_id is not None
+        api.delete(f"/api/v1/entity-tags/{tag_id}")
+        row = [x for x in api.get("/api/v1/atomic-metrics",
+              params={"page_size": 100}).json()["data"]["items"] if x["id"] == amid][0]
+        assert row["tags"] == []
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_code_rule_enforced(api):
+    """编码规范：seed 内置规则（^[a-z][a-z0-9_]*$）下不合规编码 -> 400（原子/派生/维度）"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "Bad-Code!", "name": "坏编码", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id"})
+    assert r.status_code == 400 and "编码不符合规范" in r.json()["message"]
+    r = api.post("/api/v1/derived-metrics", json={
+        "code": "Bad Code", "name": "坏编码", "atomic_code": "order_count"})
+    assert r.status_code == 400 and "编码不符合规范" in r.json()["message"]
+    r = api.post("/api/v1/dimensions", json={
+        "code": "BAD_DIM", "name": "坏维度", "domain_id": 1,
+        "physical_table": "dim_city", "join_field": "city_id",
+        "name_field": "city_name"})
+    assert r.status_code == 400 and "编码不符合规范" in r.json()["message"]
+
+
+# ===================================================================
+# 数据质量与监控：质量规则、健康度、告警
+# ===================================================================
+
+def test_quality_rule_check_ok_and_auto(api):
+    """质量规则：物化成功自动校验（trigger=auto）；手动 check 记录实例；toggle 停用"""
+    mid = _mk_ds_model(api, "qr_ok_auto")
+    r = api.post("/api/v1/quality-rules", json={
+        "entity_id": mid, "rule_type": "row_count_min",
+        "params": {"min_rows": 1}, "severity": "warning"})
+    assert r.status_code == 200, r.text
+    rid = r.json()["data"]["id"]
+    assert r.json()["data"]["entity_code"] == "qr_ok_auto"
+    try:
+        api.post(f"/api/v1/downstream-models/{mid}/materialize")
+        rules = api.get("/api/v1/quality-rules",
+                        params={"entity_id": mid}).json()["data"]["items"]
+        assert rules[0]["last_result"] == "ok" and rules[0]["last_check_at"]
+        insts = api.get("/api/v1/task-instances", params={
+            "task_type": "quality_check", "status": "SUCCESS",
+            "page_size": 100}).json()["data"]["items"]
+        assert any(i["entity_id"] == mid and i["trigger"] == "auto" for i in insts)
+        # 手动 check：结果一致，实例 trigger=manual
+        r = api.post(f"/api/v1/quality-rules/{rid}/check")
+        assert r.status_code == 200 and r.json()["data"]["result"] == "ok"
+        insts = api.get("/api/v1/task-instances", params={
+            "task_type": "quality_check",
+            "page_size": 100}).json()["data"]["items"]
+        assert any(i["entity_id"] == mid and i["trigger"] == "manual"
+                   and i["status"] == "SUCCESS" for i in insts)
+        # 停用后物化不再自动检查
+        api.post(f"/api/v1/quality-rules/{rid}/toggle")
+        assert api.get("/api/v1/quality-rules",
+                       params={"entity_id": mid}).json()["data"]["items"][0]["enabled"] is False
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_quality_rule_unmaterialized_error(api):
+    """未物化模型执行质量规则 -> error 结果 + error 告警 + 健康度 red"""
+    mid = _mk_ds_model(api, "qr_no_mat")
+    rid = api.post("/api/v1/quality-rules", json={
+        "entity_id": mid, "rule_type": "row_count_min",
+        "params": {"min_rows": 1}}).json()["data"]["id"]
+    try:
+        r = api.post(f"/api/v1/quality-rules/{rid}/check")
+        assert r.json()["data"]["result"] == "error"
+        assert "未物化" in r.json()["data"]["message"]
+        h = api.get("/api/v1/quality/health").json()["data"]
+        row = [x for x in h["items"] if x["id"] == mid][0]
+        assert row["level"] == "red" and row["rule_error"] == 1
+        alerts = api.get("/api/v1/alerts", params={"unread_only": True,
+                         "page_size": 100}).json()["data"]["items"]
+        assert any(a["level"] == "error" and a["source_type"] == "quality"
+                   and "质量规则告警" in a["message"] for a in alerts)
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_quality_rule_row_count_change_fail_and_alert(api):
+    """row_count_change：首次记录基准 -> 数据骤减触发 fail -> 告警/未读计数 -> 重试重新记基准"""
+    mid = _mk_ds_model(api, "qr_chg")
+    api.post(f"/api/v1/downstream-models/{mid}/materialize")
+    rid = api.post("/api/v1/quality-rules", json={
+        "entity_id": mid, "rule_type": "row_count_change",
+        "params": {"max_change_pct": 20}}).json()["data"]["id"]
+    try:
+        r = api.post(f"/api/v1/quality-rules/{rid}/check")
+        assert r.json()["data"]["result"] == "ok"   # 首次检查记录基准行数
+        # 物理表删到只剩最新一天 -> 行数骤减
+        from models import engine
+        from sqlalchemy import text
+        with engine.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM dl_qr_chg WHERE date_bucket < "
+                "(SELECT MAX(date_bucket) FROM dl_qr_chg)"))
+        r = api.post(f"/api/v1/quality-rules/{rid}/check")
+        assert r.json()["data"]["result"] == "fail" and "%" in r.json()["data"]["value"]
+        # 失败写 warning 告警（未读），已读接口生效
+        n0 = api.get("/api/v1/alerts/unread-count").json()["data"]["unread"]
+        alerts = api.get("/api/v1/alerts", params={"unread_only": True,
+                         "page_size": 100}).json()["data"]["items"]
+        mine = [a for a in alerts if a["source_type"] == "quality" and a["source_id"] == rid]
+        assert mine and mine[0]["level"] == "warning" and mine[0]["read"] is False
+        api.post(f"/api/v1/alerts/{mine[0]['id']}/read")
+        n1 = api.get("/api/v1/alerts/unread-count").json()["data"]["unread"]
+        assert n1 == n0 - 1
+        # 失败的质量检查实例可重试：重试后重新记基准 -> ok
+        insts = api.get("/api/v1/task-instances", params={
+            "task_type": "quality_check", "status": "FAILED",
+            "page_size": 100}).json()["data"]["items"]
+        fail = [x for x in insts if x["entity_id"] == mid][0]
+        r = api.post(f"/api/v1/task-instances/{fail['id']}/retry")
+        assert r.status_code == 200 and r.json()["data"]["result"] == "ok"
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_alerts_read_all(api):
+    """全部已读：提交审批产生 info 告警，read-all 后未读数归零"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "al_atom_t", "name": "告警原子", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_id", "status": "DRAFT"})
+    amid = r.json()["data"]["id"]
+    try:
+        api.post("/api/v1/approvals", json={"entity_type": "atomic_metric",
+                 "entity_id": amid})
+        n = api.get("/api/v1/alerts/unread-count").json()["data"]["unread"]
+        assert n >= 1
+        assert api.post("/api/v1/alerts/read-all").json()["data"]["updated"] >= 1
+        assert api.get("/api/v1/alerts/unread-count").json()["data"]["unread"] == 0
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
+def test_quality_health_levels(api):
+    """健康度三色：物化且规则全过=green / 未物化=yellow / error 规则=red，汇总与列表一致"""
+    g = _mk_ds_model(api, "hl_green")
+    y = _mk_ds_model(api, "hl_yellow")
+    r = _mk_ds_model(api, "hl_red")
+    try:
+        api.post(f"/api/v1/downstream-models/{g}/materialize")
+        rid = api.post("/api/v1/quality-rules", json={
+            "entity_id": r, "rule_type": "non_null_rate",
+            "params": {"column": "order_amount"}}).json()["data"]["id"]
+        api.post(f"/api/v1/quality-rules/{rid}/check")
+        h = api.get("/api/v1/quality/health").json()["data"]
+        by_id = {x["id"]: x for x in h["items"]}
+        assert by_id[g]["level"] == "green"
+        assert by_id[g]["materialized"] is True
+        assert by_id[g]["fresh_days"] == 0 and by_id[g]["latest_date"]
+        assert by_id[y]["level"] == "yellow" and by_id[y]["materialized"] is False
+        assert by_id[r]["level"] == "red" and by_id[r]["rule_error"] == 1
+        total = api.get("/api/v1/downstream-models",
+                        params={"page_size": 100}).json()["data"]["total"]
+        assert h["summary"]["total"] == total
+        assert h["summary"]["green"] + h["summary"]["yellow"] + \
+            h["summary"]["red"] == total
+    finally:
+        api.delete(f"/api/v1/downstream-models/{g}")
+        api.delete(f"/api/v1/downstream-models/{y}")
+        api.delete(f"/api/v1/downstream-models/{r}")
+
+
+# ===================================================================
+# 调度与运维：周期调度、任务实例、失败重试
+# ===================================================================
+
+def test_task_instance_materialize_success_and_retry(api):
+    """任务实例：物化写 SUCCESS 实例（含明细）；重试重放成功且生成新实例"""
+    mid = _mk_ds_model(api, "ti_mat_ok")
+    try:
+        r = api.post(f"/api/v1/downstream-models/{mid}/materialize")
+        assert r.status_code == 200, r.text
+        n0 = r.json()["data"]["row_count"]
+        assert r.json()["data"]["task_instance_id"] and r.json()["data"]["status"] == "SUCCESS"
+        insts = api.get("/api/v1/task-instances", params={
+            "task_type": "materialize", "status": "SUCCESS",
+            "page_size": 100}).json()["data"]["items"]
+        i1 = [x for x in insts if x["entity_id"] == mid][0]
+        assert i1["trigger"] == "manual" and i1["detail"]["row_count"] == n0
+        # 重试 -> 新 SUCCESS 实例，行数一致
+        r = api.post(f"/api/v1/task-instances/{i1['id']}/retry")
+        assert r.status_code == 200, r.text
+        assert r.json()["data"]["status"] == "SUCCESS"
+        assert r.json()["data"]["detail"]["row_count"] == n0
+        assert r.json()["data"]["id"] != i1["id"]
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_task_instance_failed_reimport_and_retry_recover(api):
+    """失败实例：物化表被删后重导失败 -> FAILED 实例 + error 告警；
+    重试失败实例仍失败，重试历史物化实例可恢复"""
+    mid = _mk_ds_model(api, "ti_fail")
+    try:
+        r = api.post(f"/api/v1/downstream-models/{mid}/materialize")
+        n0 = r.json()["data"]["row_count"]
+        from models import engine
+        from sqlalchemy import text
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE dl_ti_fail"))
+        assert api.post(f"/api/v1/downstream-models/{mid}/reimport").status_code == 500
+        insts = api.get("/api/v1/task-instances", params={
+            "task_type": "reimport", "status": "FAILED",
+            "page_size": 100}).json()["data"]["items"]
+        f = [x for x in insts if x["entity_id"] == mid][0]
+        assert f["error"]
+        alerts = api.get("/api/v1/alerts", params={"unread_only": True,
+                         "page_size": 100}).json()["data"]["items"]
+        assert any(a["level"] == "error" and a["source_type"] == "task"
+                   and "ti_fail" in a["message"] for a in alerts)
+        # 重试失败实例：仍失败，新 FAILED 实例
+        r = api.post(f"/api/v1/task-instances/{f['id']}/retry")
+        assert r.status_code == 200 and r.json()["data"]["status"] == "FAILED"
+        # 重试历史物化实例：重建表，恢复成功
+        mats = api.get("/api/v1/task-instances", params={
+            "task_type": "materialize", "status": "SUCCESS",
+            "page_size": 100}).json()["data"]["items"]
+        m0 = [x for x in mats if x["entity_id"] == mid][0]
+        r = api.post(f"/api/v1/task-instances/{m0['id']}/retry")
+        assert r.status_code == 200 and r.json()["data"]["status"] == "SUCCESS"
+        assert r.json()["data"]["detail"]["row_count"] == n0
+        # 恢复后重导成功
+        r = api.post(f"/api/v1/downstream-models/{mid}/reimport")
+        assert r.status_code == 200, r.text
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_schedule_crud_and_toggle(api):
+    """调度：创建（interval）-> 列表 -> 编辑为 daily -> 启停 -> 非法参数 400 -> 删除"""
+    mid = _mk_ds_model(api, "sch_crud")
+    try:
+        r = api.post("/api/v1/schedules", json={
+            "entity_id": mid, "schedule_type": "interval",
+            "interval_minutes": 60, "action": "materialize"})
+        assert r.status_code == 200, r.text
+        sid = r.json()["data"]["id"]
+        assert r.json()["data"]["entity_code"] == "sch_crud" and r.json()["data"]["next_run_at"]
+        row = [x for x in api.get("/api/v1/schedules").json()["data"]["items"]
+               if x["id"] == sid][0]
+        assert row["enabled"] is True and row["schedule_type"] == "interval"
+        # 编辑为 daily 整点
+        r = api.put(f"/api/v1/schedules/{sid}", json={
+            "entity_id": mid, "schedule_type": "daily", "hour": 3,
+            "minute": 30, "action": "materialize"})
+        assert r.status_code == 200, r.text
+        row = [x for x in api.get("/api/v1/schedules").json()["data"]["items"]
+               if x["id"] == sid][0]
+        assert row["schedule_type"] == "daily" and row["hour"] == 3
+        # 启停
+        assert api.post(f"/api/v1/schedules/{sid}/toggle").json()["data"]["enabled"] is False
+        assert api.post(f"/api/v1/schedules/{sid}/toggle").json()["data"]["enabled"] is True
+        # 非法类型/动作
+        assert api.post("/api/v1/schedules", json={
+            "entity_id": mid, "schedule_type": "weekly"}).status_code == 400
+        assert api.post("/api/v1/schedules", json={
+            "entity_id": mid, "schedule_type": "daily", "action": "drop"}).status_code == 400
+        # 删除
+        api.delete(f"/api/v1/schedules/{sid}")
+        assert not any(x["id"] == sid
+                       for x in api.get("/api/v1/schedules").json()["data"]["items"])
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_schedule_manual_run(api):
+    """调度立即执行：物化 + SUCCESS 实例 + last_run_at 更新 + 自动质量检查；reimport 动作可用"""
+    mid = _mk_ds_model(api, "sch_run")
+    api.post("/api/v1/quality-rules", json={
+        "entity_id": mid, "rule_type": "row_count_min",
+        "params": {"min_rows": 1}})
+    try:
+        sid = api.post("/api/v1/schedules", json={
+            "entity_id": mid, "schedule_type": "interval",
+            "interval_minutes": 30, "action": "materialize"}).json()["data"]["id"]
+        r = api.post(f"/api/v1/schedules/{sid}/run")
+        assert r.status_code == 200, r.text
+        assert r.json()["data"]["status"] == "SUCCESS"
+        assert r.json()["data"]["task_instance_id"]
+        d = api.get(f"/api/v1/downstream-models/{mid}").json()["data"]
+        assert d["materialized"] and d["row_count"] > 0
+        row = [x for x in api.get("/api/v1/schedules").json()["data"]["items"]
+               if x["id"] == sid][0]
+        assert row["last_run_at"]
+        # 实例已记录（trigger=manual），自动质量检查已跑
+        insts = api.get("/api/v1/task-instances", params={
+            "task_type": "materialize", "status": "SUCCESS",
+            "page_size": 100}).json()["data"]["items"]
+        assert any(x["entity_id"] == mid and x["trigger"] == "manual" for x in insts)
+        rules = api.get("/api/v1/quality-rules",
+                        params={"entity_id": mid}).json()["data"]["items"]
+        assert rules[0]["last_result"] == "ok" and rules[0]["last_check_at"]
+        # 动作改为重导后立即执行：删除=写入=总量（幂等）
+        api.put(f"/api/v1/schedules/{sid}", json={
+            "entity_id": mid, "schedule_type": "interval",
+            "interval_minutes": 30, "action": "reimport"})
+        r = api.post(f"/api/v1/schedules/{sid}/run")
+        assert r.status_code == 200 and r.json()["data"]["status"] == "SUCCESS"
+        api.delete(f"/api/v1/schedules/{sid}")
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")

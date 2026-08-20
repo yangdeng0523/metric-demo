@@ -16,6 +16,7 @@ from models import (
     DownstreamApp, Dataset, AppDatasetGrant,
     DimCity, DimCategory, DimUser,
     DwdOrderDetail, DwdPayDetail, DwdRefundDetail,
+    CodeRule,
 )
 from sql_generator import SQLGenerator
 
@@ -94,7 +95,7 @@ def seed_metadata(s):
         AtomicMetric(code="order_count", name="下单次数", process_id=processes[0].id,
                      agg_function="COUNT", physical_field="order_id",
                      data_type="BIGINT", unit="次", status=STATUS_PUBLISHED,
-                     description="统计订单明细行数（唯一订单）"),
+                     description="统计订单明细行数（COUNT，非去重）"),
         AtomicMetric(code="order_amount_sum", name="下单金额", process_id=processes[0].id,
                      agg_function="SUM", physical_field="order_amount",
                      data_type="DECIMAL", unit="元", status=STATUS_PUBLISHED,
@@ -202,6 +203,15 @@ def seed_metadata(s):
         AppDatasetGrant(app_id=apps[0].id, dataset_id=datasets[0].id),
         AppDatasetGrant(app_id=apps[0].id, dataset_id=datasets[1].id),
         AppDatasetGrant(app_id=apps[1].id, dataset_id=datasets[1].id),
+    ])
+
+    # 编码规范：各实体类型内置编码规则（小写下划线风格，创建/更新时校验）
+    s.add_all([
+        CodeRule(entity_type="atomic_metric", pattern=r"^[a-z][a-z0-9_]*$", example="order_amount_sum"),
+        CodeRule(entity_type="derived_metric", pattern=r"^[a-z][a-z0-9_]*$", example="pay_amount_7d_city"),
+        CodeRule(entity_type="composite_metric", pattern=r"^[a-z][a-z0-9_]*$", example="avg_order_value"),
+        CodeRule(entity_type="dimension", pattern=r"^[a-z][a-z0-9_]*$", example="dim_city"),
+        CodeRule(entity_type="logical_model", pattern=r"^[a-z][a-z0-9_]*$", example="trade_wide_order"),
     ])
 
 

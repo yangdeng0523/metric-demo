@@ -14,6 +14,13 @@ from models import get_session, AtomicMetric, DerivedMetric, CompositeMetric, Di
 import re
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# JOIN ON 仅允许 ident[.ident] = ident[.ident]，可用 AND 连接
+_ON_EQ_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?"
+    r"\s*=\s*"
+    r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$"
+)
+_FILTER_OPS = ("=", "!=", ">", "<", ">=", "<=", "IN", "NOT IN", "BETWEEN", "LIKE")
 
 # 日期粒度 -> SQLite strftime 格式（白名单映射，粒度值不直接进入 SQL）
 GRANULARITY_FMT = {"day": "%Y-%m-%d", "week": "%Y-W%W", "month": "%Y-%m"}
@@ -23,6 +30,46 @@ def _safe_ident(name: str) -> str:
     if not _IDENT_RE.match(name or ""):
         raise ValueError(f"非法标识符: {name!r}")
     return name
+
+
+def _safe_join_on(on: str) -> str:
+    """校验逻辑模型 JOIN ON：只允许等值连接，禁止注入片段"""
+    raw = (on or "").strip()
+    if not raw:
+        raise ValueError("JOIN ON 条件不能为空")
+    parts = [p.strip() for p in raw.split(" AND ") if p.strip()]
+    if not parts or not all(_ON_EQ_RE.match(p) for p in parts):
+        raise ValueError(f"非法 JOIN 条件: {on!r}，仅支持 a.col = b.col（可用 AND 连接）")
+    return raw
+
+
+def _append_filters(alias: str, filters, prefix: str, where_clauses: list, where_params: dict):
+    """业务限定：值全部参数化；支持 IN / NOT IN / BETWEEN / LIKE 等"""
+    for f in (filters or []):
+        fld = _safe_ident(f["field"])
+        op = f["op"]
+        if op not in _FILTER_OPS:
+            raise ValueError(f"不支持的操作符: {op}")
+        key = f"{prefix}_f{len(where_params)}"
+        if op in ("IN", "NOT IN"):
+            vals = f["value"] if isinstance(f["value"], list) else [f["value"]]
+            if not vals:
+                raise ValueError(f"{op} 值不能为空")
+            ph = ", ".join(f":{key}_{i}" for i in range(len(vals)))
+            where_clauses.append(f"{alias}.{fld} {op} ({ph})")
+            for i, v in enumerate(vals):
+                where_params[f"{key}_{i}"] = v
+        elif op == "BETWEEN":
+            vals = f["value"] if isinstance(f["value"], list) else [f["value"]]
+            if len(vals) != 2:
+                raise ValueError("BETWEEN 需要两个值")
+            where_clauses.append(
+                f"{alias}.{fld} BETWEEN :{key}_a AND :{key}_b")
+            where_params[f"{key}_a"] = vals[0]
+            where_params[f"{key}_b"] = vals[1]
+        else:
+            where_clauses.append(f"{alias}.{fld} {op} :{key}")
+            where_params[key] = f["value"]
 
 
 def _agg_expr(agg: str, expr: str) -> str:
@@ -133,21 +180,7 @@ class SQLGenerator:
         where_params[f"{prefix}_start"] = start.isoformat()
         where_params[f"{prefix}_end"] = end.isoformat()
 
-        for f in (filters or []):
-            fld = _safe_ident(f["field"])
-            op = f["op"]
-            if op not in ("=", "!=", ">", "<", ">=", "<=", "IN", "LIKE"):
-                raise ValueError(f"不支持的操作符: {op}")
-            key = f"{prefix}_f{len(where_params)}"
-            if op == "IN":
-                vals = f["value"] if isinstance(f["value"], list) else [f["value"]]
-                ph = ", ".join([f":{key}_{i}" for i in range(len(vals))])
-                where_clauses.append(f"t.{fld} {op} ({ph})")
-                for i, v in enumerate(vals):
-                    where_params[f"{key}_{i}"] = v
-            else:
-                where_clauses.append(f"t.{fld} {op} :{key}")
-                where_params[key] = f["value"]
+        _append_filters("t", filters, prefix, where_clauses, where_params)
 
         dims_part = (", " + ", ".join(select_cols)) if select_cols else ""
         group_part = (" GROUP BY " + ", ".join(group_cols)) if group_cols else ""
@@ -203,34 +236,38 @@ class SQLGenerator:
         select_expr = metric.expression
         for alias, ref, _ in subs:
             select_expr = select_expr.replace(ref, f"{alias}.metric_value")
-        # 防止除零
+        # 缺维度行补 0；CAST + NULLIF 防整数除 / 除零
         if "/" in select_expr:
-            import re as _re
-            select_expr = _re.sub(r"(\S+)\s*/\s*(\S+\.metric_value)",
-                                  r"CAST(\1 AS REAL) / NULLIF(\2, 0)", select_expr)
-
-        bucket_sel = ", t0.date_bucket" if bucket_fmt else ""
+            select_expr = re.sub(
+                r"(\S+\.metric_value)\s*/\s*(\S+\.metric_value)",
+                r"CAST(COALESCE(\1, 0) AS REAL) / NULLIF(COALESCE(\2, 0), 0)",
+                select_expr)
+        else:
+            for alias, _ref, _ in subs:
+                select_expr = select_expr.replace(
+                    f"{alias}.metric_value", f"COALESCE({alias}.metric_value, 0)")
 
         if not has_dims or len(subs) == 1:
+            bucket_sel = ", t0.date_bucket" if bucket_fmt else ""
             sql = f"SELECT {select_expr} AS metric_value{bucket_sel}\nFROM (\n{subs[0][2]}\n) t0"
             for alias, ref, sub_sql in subs[1:]:
                 sql += f"\nCROSS JOIN (\n{sub_sql}\n) {alias}"
             return sql, merged_params
 
-        # 带维度：按维度列（及日期桶）JOIN 各子查询
-        on_parts = " AND ".join(f"t0.{d} = {alias}.{d}"
-                                for alias, _, _ in subs[1:] for d in eff_dims)
-        if bucket_fmt:
-            on_parts = " AND ".join(
-                [f"t0.date_bucket = {alias}.date_bucket" for alias, _, _ in subs[1:]]
-            ) + (" AND " + on_parts if on_parts else "")
-        dim_select = ", ".join(f"t0.{dc}" for dc in eff_dims)
+        # 带维度：先 UNION 各子查询的维度键，再 LEFT JOIN，避免 INNER JOIN 丢掉单边有数的分组
+        key_cols = (["date_bucket"] if bucket_fmt else []) + list(eff_dims)
+        key_list = ", ".join(key_cols)
+        union_sql = " UNION ".join(
+            f"SELECT {key_list} FROM (\n{sub_sql}\n)" for _a, _c, sub_sql in subs)
+        dim_select = ", ".join(f"k.{dc}" for dc in eff_dims)
+        bucket_sel = ", k.date_bucket" if bucket_fmt else ""
         sql = (
             f"SELECT {select_expr} AS metric_value{bucket_sel}, {dim_select}\n"
-            f"FROM (\n{subs[0][2]}\n) t0\n"
+            f"FROM (\n{union_sql}\n) k\n"
         )
-        for alias, ref, sub_sql in subs[1:]:
-            sql += f"JOIN (\n{sub_sql}\n) {alias} ON {on_parts}\n"
+        for alias, _ref, sub_sql in subs:
+            on_parts = " AND ".join(f"k.{c} = {alias}.{c}" for c in key_cols)
+            sql += f"LEFT JOIN (\n{sub_sql}\n) {alias} ON {on_parts}\n"
         return sql.rstrip("\n"), merged_params
 
     # ------------------------------------------------------------------
@@ -370,11 +407,12 @@ class SQLGenerator:
         t = _safe_ident(m.physical_table)
         joins = []
         for i, j in enumerate(m.join_config or []):
-            at = _safe_ident(j.get("table", ""))
-            alias = _safe_ident(j.get("alias", f"d{i}"))
-            on = j.get("on", "")
-            if not on:
+            tbl = j.get("table", "")
+            if not tbl:
                 continue
+            at = _safe_ident(tbl)
+            alias = _safe_ident(j.get("alias", f"d{i}"))
+            on = _safe_join_on(j.get("on", ""))
             joins.append(f"LEFT JOIN {at} {alias} ON {on}")
         select_cols = ", ".join(["t.*"] + [f"{_safe_ident(j.get('alias', 'd' + str(i)))}.*"
                                            for i, j in enumerate(m.join_config or [])])
@@ -443,21 +481,7 @@ class SQLGenerator:
                                   f"lm.{_safe_ident(date_field)} <= :p{i}_end"]
                 params[f"p{i}_start"] = start.isoformat()
                 params[f"p{i}_end"] = end.isoformat()
-                for f in metric.filters or []:
-                    fld = _safe_ident(f["field"])
-                    op = f["op"]
-                    if op not in ("=", "!=", ">", "<", ">=", "<=", "IN", "LIKE"):
-                        raise ValueError(f"不支持的操作符: {op}")
-                    key = f"p{i}_f{len(params)}"
-                    if op == "IN":
-                        vals = f["value"] if isinstance(f["value"], list) else [f["value"]]
-                        ph = ", ".join([f":{key}_{k}" for k in range(len(vals))])
-                        where_clauses.append(f"lm.{fld} {op} ({ph})")
-                        for k, v in enumerate(vals):
-                            params[f"{key}_{k}"] = v
-                    else:
-                        where_clauses.append(f"lm.{fld} {op} :{key}")
-                        params[key] = f["value"]
+                _append_filters("lm", metric.filters, f"p{i}", where_clauses, params)
 
             # 聚合口径：派生指标取其底层原子指标（派生本身无 agg_function）
             base = metric.atomic if mtype == "derived" else metric

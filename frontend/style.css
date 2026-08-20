@@ -321,3 +321,75 @@ code {
   .summary { grid-template-columns: repeat(2, 1fr); }
   .sidebar-foot { display: none; }
 }
+
+/* ================= 治理 / 质量 / 运维 ================= */
+.badge.status.warn { background: var(--warning-50); color: #d46b08; border-color: #ffe58f; }
+
+/* 顶部右侧 + 通知铃铛 */
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+.bell-wrap { position: relative; }
+.bell-btn {
+  position: relative; display: flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px; border-radius: 50%;
+  border: 1px solid var(--border); background: #fff; color: var(--text-2);
+  cursor: pointer; transition: var(--transition);
+}
+.bell-btn:hover { color: var(--primary); border-color: var(--primary); }
+.alert-badge {
+  position: absolute; top: -5px; right: -6px; min-width: 18px; height: 18px;
+  padding: 0 5px; border-radius: 999px; background: var(--danger); color: #fff;
+  font-size: 11px; line-height: 18px; text-align: center; font-weight: 600;
+  box-shadow: 0 0 0 2px #fff;
+}
+.bell-dropdown {
+  display: none; position: absolute; right: 0; top: 44px; width: 360px;
+  max-height: 440px; overflow-y: auto; background: var(--surface);
+  border: 1px solid var(--border-light); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); z-index: 150;
+}
+.bell-dropdown.open { display: block; }
+.bell-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border-light);
+  position: sticky; top: 0; background: var(--surface);
+}
+.alert-item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 11px 16px; border-bottom: 1px solid var(--border-light);
+  cursor: pointer; transition: var(--transition);
+}
+.alert-item:hover { background: var(--primary-50); }
+.alert-item.unread { background: #fafffe; }
+.alert-main { flex: 1; min-width: 0; }
+.alert-msg { font-size: 13px; color: var(--text); line-height: 1.5; }
+.alert-time { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+.alert-dot {
+  flex: none; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%;
+  background: var(--primary);
+}
+.alert-empty { padding: 32px 0; text-align: center; color: var(--text-3); font-size: 13px; }
+
+/* 标签输入（编辑表单 chips） */
+.tag-input {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 5px 8px; min-height: 38px;
+}
+.tag-input:focus-within { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-50); }
+.chip-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: var(--primary-50); color: var(--primary-600);
+  border-radius: 4px; padding: 2px 8px; font-size: 12.5px;
+}
+.tag-x {
+  cursor: pointer; font-weight: 600; color: var(--primary-600);
+  opacity: 0.65; padding: 0 2px; font-size: 13px; line-height: 1;
+}
+.tag-x:hover { opacity: 1; color: var(--danger); }
+.tag-input-in {
+  border: none !important; outline: none; flex: 1; min-width: 90px;
+  padding: 4px 2px; font-size: 13px; box-shadow: none !important;
+}
+
+/* 筛选下拉（任务运维） */
+.mini-select { width: 120px; }

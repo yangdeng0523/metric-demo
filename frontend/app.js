@@ -11,6 +11,21 @@ const FILTER_OPS = ["=", "!=", ">", ">=", "<", "<=", "IN", "NOT IN", "BETWEEN", 
 const AGG_FUNCTIONS = ["SUM", "COUNT", "AVG", "MAX", "MIN", "COUNT_DISTINCT"];
 const JOIN_TYPES = ["SINGLE", "JOIN"];
 const CHART_COLORS = ["#2563eb", "#059669", "#d97706", "#7c3aed", "#dc2626", "#0891b2", "#db2777", "#65a30d"];
+const ENTITY_TYPE_LABEL = { atomic_metric: "原子指标", derived_metric: "派生指标", composite_metric: "复合指标", dimension: "维度", logical_model: "逻辑模型", downstream_model: "下游模型" };
+const VERSION_CHANGE_LABEL = { update: "编辑", status: "状态变更", approve: "审批发布", rollback: "回滚" };
+const RULE_TYPE_LABEL = { row_count_min: "行数下限", row_count_change: "行数波动", non_null_rate: "非空率", fresh_days: "新鲜度" };
+const RULE_TYPE_PARAMS = {
+  row_count_min: [{ key: "min_rows", label: "行数下限", type: "number", placeholder: "如 100" }],
+  row_count_change: [{ key: "max_change_pct", label: "波动阈值 %", type: "number", placeholder: "如 20" }],
+  non_null_rate: [{ key: "column", label: "校验列", type: "text", placeholder: "如 order_amount_sum" }, { key: "min_rate", label: "非空率阈值 %", type: "number", placeholder: "如 95" }],
+  fresh_days: [{ key: "max_days", label: "最大天数", type: "number", placeholder: "如 7" }],
+};
+const TASK_TYPE_LABEL = { materialize: "物化", reimport: "重导", quality_check: "质量检查" };
+const TRIGGER_LABEL = { manual: "手动", schedule: "调度", auto: "自动" };
+const TASK_STATUS_LABEL = { PENDING: "待执行", RUNNING: "运行中", SUCCESS: "成功", FAILED: "失败", SKIPPED: "跳过" };
+const APPROVAL_STATUS_LABEL = { PENDING: "待审批", APPROVED: "已同意", REJECTED: "已驳回" };
+const ALERT_LEVEL_LABEL = { info: "提示", warning: "警告", error: "错误" };
+const HEALTH_LABEL = { green: "健康", yellow: "关注", red: "告警" };
 
 // 全局状态（缓存，变更后刷新）
 let META = { atomic: [], derived: [], composite: [] };
@@ -25,6 +40,7 @@ let DATASETS = [];
 let CURRENT_TAB = "query";
 let LINEAGE_VIEW = "metric";
 let LAST_QUERY = null;
+const APP_SECRETS = {};  // 会话内缓存：仅创建/重置时拿到明文 AppSecret
 
 // ---------------------------------------------------------------- 工具函数
 const $ = id => document.getElementById(id);
@@ -35,8 +51,7 @@ function esc(s) {
 function fmt(v) {
   if (v === null || v === undefined) return "-";
   if (typeof v === "number") {
-    if (Math.abs(v) < 1 && v !== 0) return (v * 100).toFixed(2) + "%";
-    return v.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+    return v.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
   }
   return v;
 }
@@ -213,6 +228,38 @@ function openModal({ title, fields = [], value = {}, width = 560, hint = "", onO
         wrap.appendChild(pre);
         break;
       }
+      case "tags": { // 标签输入：chips + 回车添加
+        const box = document.createElement("div");
+        box.className = "tag-input";
+        box.id = "f-" + f.key;
+        const tags = [...new Set((value[f.key] || []).map(String).filter(Boolean))];
+        const render = () => {
+          box.innerHTML = "";
+          for (const t of tags) {
+            const c = document.createElement("span");
+            c.className = "chip-tag";
+            c.innerHTML = `${esc(t)}<b class="tag-x" data-t="${esc(t)}">×</b>`;
+            c.querySelector(".tag-x").onclick = () => { tags.splice(tags.indexOf(t), 1); render(); };
+            box.appendChild(c);
+          }
+          const inp = document.createElement("input");
+          inp.className = "tag-input-in";
+          inp.placeholder = f.placeholder || "回车添加标签";
+          inp.onkeydown = e => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              const v = inp.value.trim();
+              if (v && !tags.includes(v)) { tags.push(v); render(); }
+            } else if (e.key === "Backspace" && !inp.value && tags.length) {
+              tags.pop(); render();
+            }
+          };
+          box.appendChild(inp);
+        };
+        render();
+        wrap.appendChild(box);
+        break;
+      }
       default: {
         const inp = document.createElement("input");
         inp.type = f.type === "number" ? "number" : f.type === "date" ? "date" : "text";
@@ -266,6 +313,8 @@ function openModal({ title, fields = [], value = {}, width = 560, hint = "", onO
         out[f.key] = joins;
       } else if (f.type === "pre") {
         continue;
+      } else if (f.type === "tags") {
+        out[f.key] = [...document.querySelectorAll(`#f-${f.key} .chip-tag .tag-x`)].map(c => c.dataset.t);
       } else {
         const el = document.getElementById("f-" + f.key);
         let val = el.value;
@@ -278,7 +327,6 @@ function openModal({ title, fields = [], value = {}, width = 560, hint = "", onO
         return;
       }
     }
-    out._refs = [...document.querySelectorAll("#f-refs input:checked")].map(c => c.value);
     const btn = $("modal-ok");
     btn.disabled = true; btn.textContent = "提交中…";
     try {
@@ -366,9 +414,12 @@ const TITLES = {
   dims: ["维度与维度属性", "观察和分析数据的角度，属性的统一定义和管理"],
   derived: ["派生指标", "原子指标 + 修饰词（时间周期 / 统计粒度 / 筛选条件）派生为业务指标"],
   composites: ["复合指标", "基于派生指标的四则运算，如 客单价 = 支付金额 ÷ 支付笔数"],
+  approvals: ["审批中心", "指标提交发布后进入审批流程：同意 → 正式生效（PUBLISHED），驳回 → 保持原状态"],
   models: ["逻辑模型", "将物理表映射为逻辑模型，屏蔽底层表结构差异（P1）"],
   downstreams: ["下游模型", "基于逻辑模型 + 指标集合生成 DWS 汇总表，支持物化落地；上游更新上线后可按时间范围重导（默认近 3 个月）"],
   reimport: ["任务重导", "选择模型/指标/维度 → 查看下游任务血缘 → 生成重导执行计划并手动执行；指标维度修改后自动提示受影响下游"],
+  quality: ["质量监控", "质量规则自动/手动检查 + 健康度总览（绿/黄/红），失败自动生成站内告警"],
+  ops: ["任务运维", "周期调度配置（日/间隔）+ 任务实例运行记录，物化 / 重导 / 质量检查失败可重试"],
   datasets: ["数据集", "可被下游应用调用的数据资产：物化表直读 / 指标实时计算，供报表看板消费"],
   openapi: ["开放 API", "下游应用通过 AppKey + AppSecret 认证直接查询数据集，调用可监控"],
   lineage: ["血缘追溯", "指标血缘（原子 → 派生 → 复合）+ 表血缘（物理表 → 逻辑模型 → 下游模型）"],
@@ -388,12 +439,16 @@ function switchTab(tab) {
   else if (tab === "dims") renderDims();
   else if (tab === "derived") renderDerived();
   else if (tab === "composites") renderComposites();
+  else if (tab === "approvals") renderApprovals();
   else if (tab === "models") renderModels();
   else if (tab === "downstreams") renderDownstreams();
   else if (tab === "reimport") renderReimport();
+  else if (tab === "quality") renderQuality();
+  else if (tab === "ops") renderOps();
   else if (tab === "datasets") renderDatasets();
   else if (tab === "openapi") renderOpenapi();
   else if (tab === "lineage") renderLineage();
+  refreshAlertBadge();
 }
 
 function fillAllSelects() {
@@ -438,13 +493,15 @@ async function runQuery() {
     const s = d.summary;
     const metricChips = s.metric_names.map((n, i) =>
       `<span class="tag agg">${esc(n)}<span class="hint-text" style="margin-left:4px">${TYPE_LABEL[s.metric_types[i]]}</span></span>`).join(" ");
+    const perMetric = (s.metrics || []).map(m =>
+      `<div class="sum-card total"><b>${fmt(m.total)}</b><span>${esc(m.name)}合计</span></div>`).join("");
     $("summary-cards").innerHTML = `
       <div class="sum-card" style="grid-column:span 2;justify-content:center">
         <div style="display:flex;flex-wrap:wrap;gap:6px">${metricChips}</div>
         <span>粒度：${GRANULARITY_LABEL[s.granularity] || s.granularity} · 口径一致</span>
       </div>
       <div class="sum-card total"><b>${s.row_count}</b><span>分组行数</span></div>
-      <div class="sum-card total"><b>${fmt(s.total)}</b><span>合计</span></div>`;
+      ${perMetric}`;
     $("result-hint").textContent = `${s.metric_names.length} 个指标 · ${d.columns.length - 1 - s.metric_names.length} 个统计维度 · ${s.row_count} 行`;
     renderTable($("result-table"), d.columns, d.rows);
     renderChart(d.columns, d.rows, s.metric_names.length);
@@ -620,21 +677,33 @@ async function processForm(id) {
 }
 
 // ---------------------------------------------------------------- 原子指标
+function tagChips(tags) {
+  return (tags || []).map(t => `<span class="tag attr">${esc(t)}</span>`).join("") || '<span class="hint-text">-</span>';
+}
+
+// 批量设置实体标签（全量替换）
+async function saveTags(entityType, entityId, tags) {
+  await post("/entity-tags", { entity_type: entityType, entity_id: entityId, tags: tags || [] });
+}
+
 function renderAtomics() {
   const kw = $("kw-atomics").value.trim();
   api(`/atomic-metrics?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-atomics").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>业务过程</th><th>聚合方式</th><th>物理字段</th><th>单位</th><th>状态</th><th style="width:240px">操作</th></tr></thead>
+    $("tbl-atomics").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>业务过程</th><th>聚合方式</th><th>物理字段</th><th>单位</th><th>状态</th><th>标签</th><th style="width:300px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td><td>${esc(x.process_name)}</td>
         <td><span class="tag agg">${x.agg_function}</span></td>
         <td><span class="tag">${esc(x.physical_table)}.${esc(x.physical_field)}</span></td>
         <td>${esc(x.unit)}</td>
         <td>${statusBadge(x.status)}</td>
+        <td>${tagChips(x.tags)}</td>
         <td>
+          <button class="btn-ghost btn-sm" data-act="status" data-id="${x.id}">${x.status === "PUBLISHED" ? "归档" : "提交发布"}</button>
+          <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
+          <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
-          <button class="btn-ghost btn-sm" data-act="status" data-id="${x.id}">${x.status === "PUBLISHED" ? "归档" : "发布"}</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
-        </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无原子指标</td></tr>`}</tbody>`;
+        </td></tr>`).join("") || `<tr><td colspan="9" class="empty">暂无原子指标</td></tr>`}</tbody>`;
   });
 }
 
@@ -658,11 +727,13 @@ async function atomicForm(id) {
       { key: "unit", label: "单位", type: "text", placeholder: "如 元 / 次" },
       { key: "status", label: "状态", type: "status" },
       { key: "description", label: "业务说明", type: "textarea", span: 2 },
+      { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心指标" },
     ],
     value: v,
     onOk: async (o) => {
       if (id) {
         await put(`/atomic-metrics/${id}`, o);
+        await saveTags("atomic_metric", id, o.tags || []);
         await refreshAll();
         // 口径已更新：存在受影响下游则自动弹出重导执行计划（返回 true 接管关闭）
         return checkImpactAfterUpdate("atomic_metric", id);
@@ -677,17 +748,20 @@ async function atomicForm(id) {
 function renderDims() {
   const kw = $("kw-dims").value.trim();
   api(`/dimensions${kw ? "?keyword=" + encodeURIComponent(kw) : ""}`).then(list => {
-    $("tbl-dims").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>主题域</th><th>物理表</th><th>关联键</th><th>属性</th><th style="width:260px">操作</th></tr></thead>
+    $("tbl-dims").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>主题域</th><th>物理表</th><th>关联键</th><th>属性</th><th>标签</th><th style="width:320px">操作</th></tr></thead>
       <tbody>${(list || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td><td>${esc(x.domain_name)}</td>
         <td><span class="tag">${esc(x.physical_table)}</span></td>
         <td><code>${esc(x.join_field)}</code></td>
         <td>${(x.attributes || []).map(a => `<span class="tag attr" title="${esc(a.physical_field)}">${esc(a.name)}</span>`).join("") || '<span class="hint-text">-</span>'}</td>
+        <td>${tagChips(x.tags)}</td>
         <td>
           <button class="btn-ghost btn-sm" data-act="attrs" data-id="${x.id}">属性</button>
+          <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
+          <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
-        </td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无维度</td></tr>`}</tbody>`;
+        </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无维度</td></tr>`}</tbody>`;
   });
 }
 
@@ -704,11 +778,13 @@ async function dimForm(id) {
       { key: "join_field", label: "关联字段（与事实表 JOIN）", type: "text", required: true, placeholder: "如 city_id" },
       { key: "name_field", label: "展示字段（分组显示）", type: "text", required: true, placeholder: "如 city_name" },
       { key: "description", label: "描述", type: "textarea", span: 2 },
+      { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 公共维度" },
     ],
     value: v,
     onOk: async (o) => {
       if (id) {
         await put(`/dimensions/${id}`, o);
+        await saveTags("dimension", id, o.tags || []);
         await refreshAll();
         return checkImpactAfterUpdate("dimension", id);
       }
@@ -769,7 +845,7 @@ async function attrManager(dimId) {
 function renderDerived() {
   const kw = $("kw-derived").value.trim();
   api(`/derived-metrics?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-derived").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>原子指标</th><th>时间周期</th><th>统计粒度</th><th>业务限定</th><th>状态</th><th style="width:240px">操作</th></tr></thead>
+    $("tbl-derived").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>原子指标</th><th>时间周期</th><th>统计粒度</th><th>业务限定</th><th>状态</th><th style="width:330px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td>
         <td><span class="tag agg">${esc(x.atomic_code)}</span></td>
@@ -780,6 +856,8 @@ function renderDerived() {
         <td>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm" data-act="sql" data-id="${x.id}">SQL</button>
+          <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
+          <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
         </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无派生指标</td></tr>`}</tbody>`;
   });
@@ -805,11 +883,13 @@ async function derivedForm(id) {
       { key: "filters", label: "业务限定（修饰词 ③）", type: "filters", span: 2, hint: "运算符支持 = != > >= < <= IN NOT IN BETWEEN LIKE" },
       { key: "status", label: "状态", type: "status" },
       { key: "description", label: "业务说明", type: "textarea", span: 2 },
+      { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心指标" },
     ],
     value: v,
     onOk: async (o) => {
       if (id) {
         await put(`/derived-metrics/${id}`, o);
+        await saveTags("derived_metric", id, o.tags || []);
         await refreshAll();
         return checkImpactAfterUpdate("derived_metric", id);
       }
@@ -843,7 +923,7 @@ function sqlPreviewModal(title, sql, params) {
 function renderComposites() {
   const kw = $("kw-composites").value.trim();
   api(`/composite-metrics?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-composites").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>计算表达式</th><th>引用指标</th><th>单位</th><th style="width:240px">操作</th></tr></thead>
+    $("tbl-composites").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>计算表达式</th><th>引用指标</th><th>单位</th><th style="width:300px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td>
         <td><code class="flt">${esc(x.expression)}</code></td>
@@ -852,6 +932,8 @@ function renderComposites() {
         <td>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm" data-act="sql" data-id="${x.id}">SQL</button>
+          <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
+          <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
         </td></tr>`).join("") || `<tr><td colspan="6" class="empty">暂无复合指标</td></tr>`}</tbody>`;
   });
@@ -871,15 +953,19 @@ async function compositeForm(id) {
       { key: "unit", label: "单位", type: "text" },
       { key: "status", label: "状态", type: "status" },
       { key: "description", label: "业务说明", type: "textarea", span: 2 },
+      { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心指标" },
     ],
     value: v,
     onOk: async (o) => {
-      const refs = o._refs;
+      const refs = o.ref_codes || [];
+      if (!refs.length) throw new Error("请至少选择一个引用的派生指标");
       for (const r of refs) {
         if (!o.expression.includes(r)) { throw new Error(`表达式未引用所选指标 ${r}`); }
       }
-      delete o._refs;
-      if (id) await put(`/composite-metrics/${id}`, o);
+      if (id) {
+        await put(`/composite-metrics/${id}`, o);
+        await saveTags("composite_metric", id, o.tags || []);
+      }
       else await post("/composite-metrics", o);
       await refreshAll();
     },
@@ -889,7 +975,7 @@ async function compositeForm(id) {
 // ---------------------------------------------------------------- 逻辑模型
 function renderModels() {
   api("/logical-models").then(list => {
-    $("tbl-models").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>主题域</th><th>物理表</th><th>JOIN 类型</th><th>JOIN 表数</th><th style="width:240px">操作</th></tr></thead>
+    $("tbl-models").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>主题域</th><th>物理表</th><th>JOIN 类型</th><th>JOIN 表数</th><th style="width:300px">操作</th></tr></thead>
       <tbody>${(list || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td><td>${esc(x.domain_name)}</td>
         <td><span class="tag">${esc(x.physical_table)}</span></td>
@@ -898,6 +984,8 @@ function renderModels() {
         <td>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm" data-act="sql" data-id="${x.id}">SQL</button>
+          <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
+          <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
         </td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无逻辑模型</td></tr>`}</tbody>`;
   });
@@ -917,12 +1005,14 @@ async function modelForm(id) {
       { key: "join_type", label: "JOIN 类型", type: "select", required: true, options: JOIN_TYPES.map(j => ({ value: j, label: j === "SINGLE" ? "SINGLE（单表）" : "JOIN（多表关联）" })) },
       { key: "join_config", label: "JOIN 配置（关联表与条件）", type: "joins", span: 2, hint: "ON 条件示例: t.city_id = d0.city_id" },
       { key: "description", label: "描述", type: "textarea", span: 2 },
+      { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心模型" },
     ],
     value: v,
     onOk: async (o) => {
       if (o.join_type === "SINGLE") o.join_config = [];
       if (id) {
         await put(`/logical-models/${id}`, o);
+        await saveTags("logical_model", id, o.tags || []);
         await refreshAll();
         return checkImpactAfterUpdate("logical_model", id);
       }
@@ -1222,6 +1312,538 @@ async function checkImpactAfterUpdate(type, id) {
     if (d.downstreams.length) return reimportPlanModal(d.object, d.downstreams);
   } catch { /* 影响分析失败不阻断保存流程 */ }
 }
+
+// ================================================================
+// 治理与生命周期：版本历史 / 回滚 / 变更影响评估 / 审批发布
+// ================================================================
+
+// 版本历史弹窗：列表 + 查看快照 + 回滚
+async function versionsModal(entityType, entityId) {
+  const d = await api(`/metric-versions?entity_type=${entityType}&entity_id=${entityId}&page=1&page_size=50`);
+  openModal({ title: "版本历史（变更前快照，最新在前）", width: 760, fields: [], onOk: async () => {} });
+  $("modal-ok").style.display = "none";
+  $("modal-cancel").textContent = "关 闭";
+  const listHtml = () => (d.items || []).map(v => `<tr>
+    <td><span class="badge status pub">${esc(v.version_no)}</span></td>
+    <td>${VERSION_CHANGE_LABEL[v.change_type] || v.change_type}</td>
+    <td class="hint-text">${esc(v.change_note || "-")}</td>
+    <td class="hint-text">${esc(v.created_at)}</td>
+    <td>
+      <button class="btn-ghost btn-sm" data-v-snap="${v.id}">快照</button>
+      <button class="btn-ghost btn-sm danger" data-v-rollback="${v.id}">回滚</button>
+    </td></tr>`).join("");
+  const renderList = () => {
+    $("modal-title").textContent = "版本历史（变更前快照，最新在前）";
+    $("modal-body").innerHTML = `<div class="hint-text" style="margin-bottom:10px">每次编辑 / 状态变更 / 审批发布前自动存档；回滚将把该版本快照写回实体并生成 rollback 版本记录</div>
+      <div class="table-wrap"><table><thead><tr><th>版本</th><th>类型</th><th>说明</th><th>时间</th><th style="width:130px">操作</th></tr></thead>
+      <tbody>${listHtml() || '<tr><td colspan="5" class="empty">暂无版本记录（编辑 / 审批等变更会自动存档）</td></tr>'}</tbody></table></div>`;
+    $("modal-body").querySelectorAll("[data-v-snap]").forEach(b => b.onclick = () => {
+      const ver = (d.items || []).find(v => v.id === Number(b.dataset.vSnap));
+      if (!ver) return;
+      $("modal-title").textContent = `版本快照 · ${ver.version_no}`;
+      $("modal-body").innerHTML = `<div class="form-grid">
+        <div class="field"><label>版本信息</label><pre class="form-pre">版本 ${esc(ver.version_no)} · ${VERSION_CHANGE_LABEL[ver.change_type] || ver.change_type} · ${esc(ver.created_at)}
+${esc(ver.change_note || "无说明")}</pre></div>
+        <div class="field"><label>快照内容（JSON）</label><pre class="form-pre" style="max-height:380px;overflow:auto">${esc(JSON.stringify(ver.snapshot, null, 2))}</pre></div>
+      </div>
+      <div style="margin-top:14px"><button class="btn-ghost btn-sm" id="v-back">← 返回版本列表</button></div>`;
+      $("v-back").onclick = renderList;
+    });
+    $("modal-body").querySelectorAll("[data-v-rollback]").forEach(b => b.onclick = async () => {
+      const ver = (d.items || []).find(v => v.id === Number(b.dataset.vRollback));
+      if (!ver) return;
+      if (!window.confirm(`回滚到 ${ver.version_no}（${esc(ver.created_at)}）？实体将恢复为该版本快照`)) return;
+      try {
+        await post(`/metric-versions/${ver.id}/rollback`);
+        toast("回滚成功");
+        closeModal();
+        await refreshAll();
+      } catch (e) { toast(e.message, false); }
+    });
+  };
+  renderList();
+  $("modal-backdrop").classList.add("open");
+}
+
+// 变更影响评估弹窗：统计 + 血缘链 + 派生/复合/数据集清单
+async function impactModal(objectType, objectId) {
+  const r = await api(`/impact-report?object_type=${objectType}&object_id=${objectId}`);
+  const s = r.summary || {};
+  const cards = [
+    { n: s.downstream_models ?? 0, t: "受影响下游模型" },
+    { n: s.derived_metrics ?? 0, t: "派生指标" },
+    { n: s.composite_metrics ?? 0, t: "复合指标" },
+    { n: s.datasets ?? 0, t: "数据集" },
+    { n: s.granted_apps ?? 0, t: "授权应用" },
+  ];
+  // 血缘链图：对象 →(派生中介)→ 逻辑模型 → 下游模型（chain[0] 即对象自身）
+  const graph = { nodes: [], edges: [] };
+  const seen = new Set();
+  const addNode = (id, label, code, type) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    graph.nodes.push({ id, label, code, type });
+  };
+  addNode("obj", r.object.name, r.object.code, objectType);
+  (r.downstreams || []).forEach(dm => {
+    const chain = dm.chain || [];
+    let prev = "obj";
+    chain.forEach((c, i) => {
+      if (i === 0) return;
+      const nid = `${c.type}:${c.code}`;
+      addNode(nid, c.name || c.code, c.code, c.type);
+      graph.edges.push({ from: prev, to: nid });
+      prev = nid;
+    });
+  });
+  const LEVEL = { atomic_metric: 0, dimension: 0, derived_metric: 1, logical_model: 2, downstream: 3 };
+  const STYLE = {
+    atomic_metric: ["#e6f4ff", "#1677ff", "原子指标"],
+    dimension: ["#f9f0ff", "#722ed1", "维度"],
+    derived_metric: ["#fff7e6", "#d46b08", "派生指标"],
+    composite_metric: ["#f6ffed", "#389e0d", "复合指标"],
+    logical_model: ["#f0f5ff", "#2f54eb", "逻辑模型"],
+    downstream: ["#e6fffb", "#08979c", "下游模型"],
+  };
+  const dsRows = (r.downstreams || []).map(dm => `<tr>
+    <td><code>${esc(dm.code)}</code></td><td>${esc(dm.name)}</td>
+    <td>${dm.materialized ? `<span class="badge status pub">已物化</span>` : `<span class="badge soft">未物化</span>`}</td>
+    <td><code>${esc(dm.physical_table || "-")}</code></td>
+    <td class="num">${fmt(dm.row_count)}</td></tr>`).join("");
+  const derivedChips = (r.derived || []).map(x => `<span class="tag agg">${esc(x.code)}</span>`).join(" ") || '<span class="hint-text">无</span>';
+  const compositeChips = (r.composite || []).map(x => `<span class="tag">${esc(x.code)}</span>`).join(" ") || '<span class="hint-text">无</span>';
+  const dsListRows = (r.datasets || []).map(ds => `<tr>
+    <td><code>${esc(ds.code)}</code></td><td>${esc(ds.name)}</td>
+    <td>${ds.source_type === "downstream_model" ? "物化表" : "指标实时查询"}</td>
+    <td>${(ds.granted_apps || []).map(a => `<span class="tag">${esc(a.name)}</span>`).join(" ") || '<span class="hint-text">未授权</span>'}</td></tr>`).join("");
+  openModal({ title: `变更影响评估 · ${r.object.name}（${r.object.code}）`, width: 860, fields: [], onOk: async () => {} });
+  $("modal-ok").style.display = "none";
+  $("modal-cancel").textContent = "关 闭";
+  $("modal-body").innerHTML = `
+    <div class="summary" style="grid-template-columns:repeat(5,1fr);margin-bottom:14px">
+      ${cards.map(c => `<div class="sum-card total" style="padding:10px 14px"><b>${c.n}</b><span>${c.t}</span></div>`).join("")}
+    </div>
+    <div class="field"><label>影响血缘链（对象 → 逻辑模型 → 下游模型）</label>
+      <div class="lineage-wrap" style="min-height:220px;margin:6px 0 16px"><div class="lineage-graph" id="impact-graph"></div></div>
+    </div>
+    <div class="field"><label>受影响下游模型（${(r.downstreams || []).length}）</label>
+      <div class="table-wrap"><table><thead><tr><th>编码</th><th>名称</th><th>物化</th><th>物化表</th><th>行数</th></tr></thead>
+      <tbody>${dsRows || '<tr><td colspan="5" class="empty">无</td></tr>'}</tbody></table></div>
+    </div>
+    <div class="form-grid" style="margin-top:14px">
+      <div class="field"><label>引用此对象的派生指标（${(r.derived || []).length}）</label>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">${derivedChips}</div></div>
+      <div class="field"><label>引用派生指标的复合指标（${(r.composite || []).length}）</label>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">${compositeChips}</div></div>
+    </div>
+    <div class="field" style="margin-top:14px"><label>关联数据集与授权应用</label>
+      <div class="table-wrap"><table><thead><tr><th>编码</th><th>名称</th><th>数据源</th><th>授权应用</th></tr></thead>
+      <tbody>${dsListRows || '<tr><td colspan="4" class="empty">无</td></tr>'}</tbody></table></div>
+    </div>`;
+  if (graph.nodes.length > 1) renderGraph($("impact-graph"), graph, LEVEL, STYLE);
+  else $("impact-graph").innerHTML = '<span class="hint-text">暂无下游血缘（该对象未被任何下游模型引用）</span>';
+  $("modal-backdrop").classList.add("open");
+}
+
+// 提交发布审批（入口仅原子指标行按钮；通过后置 PUBLISHED）
+function submitApproval(entityType, entityId, entityName) {
+  openModal({
+    title: `提交发布审批 · ${entityName}`,
+    fields: [{ key: "comment", label: "发布说明（审批人可见）", type: "textarea", span: 2, placeholder: "如：口径已确认，申请发布上线" }],
+    onOk: async (o) => {
+      await post("/approvals", { entity_type: entityType, entity_id: entityId, comment: o.comment });
+      toast("已提交审批，请在「审批中心」处理");
+      closeModal();
+      await refreshAll();
+      return true;
+    },
+  });
+}
+
+// ---------------------------------------------------------------- 审批中心
+let APPROVAL_VIEW = "pending";   // pending 待办 / history 历史
+
+function renderApprovals() {
+  document.querySelectorAll("#approval-seg .seg-item").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === APPROVAL_VIEW));
+  api("/approvals?page=1&page_size=100").then(d => {
+    const rows = (d.items || []).filter(a =>
+      APPROVAL_VIEW === "pending" ? a.status === "PENDING" : a.status !== "PENDING");
+    const statusBadge = a => a.status === "APPROVED" ? `<span class="badge status pub">${APPROVAL_STATUS_LABEL[a.status]}</span>`
+      : a.status === "REJECTED" ? `<span class="badge status arch">${APPROVAL_STATUS_LABEL[a.status]}</span>`
+      : `<span class="badge status">${APPROVAL_STATUS_LABEL[a.status]}</span>`;
+    $("tbl-approvals").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>类型</th><th>动作</th><th>状态</th><th>说明</th><th>提交时间</th><th>审批时间</th><th style="width:150px">操作</th></tr></thead>
+      <tbody>${rows.map(a => `<tr>
+        <td><code>${esc(a.entity_code)}</code></td><td>${esc(a.entity_name)}</td>
+        <td>${ENTITY_TYPE_LABEL[a.entity_type] || a.entity_type}</td>
+        <td><span class="tag">发布</span></td>
+        <td>${statusBadge(a)}</td>
+        <td class="hint-text">${esc(a.comment || "-")}</td>
+        <td class="hint-text">${esc(a.created_at)}</td>
+        <td class="hint-text">${esc(a.reviewed_at || "-")}</td>
+        <td>${a.status === "PENDING" ? `
+          <button class="btn-ghost btn-sm" data-approve="${a.id}">同意</button>
+          <button class="btn-ghost btn-sm danger" data-reject="${a.id}">驳回</button>` : `<span class="hint-text">已处理</span>`}</td>
+      </tr>`).join("") || `<tr><td colspan="9" class="empty">${APPROVAL_VIEW === "pending" ? "暂无待审批事项（原子指标行点击「提交发布」发起）" : "暂无审批历史"}</td></tr>`}</tbody>`;
+    $("tbl-approvals").querySelectorAll("[data-approve]").forEach(b => b.onclick = () => approvalReview(Number(b.dataset.approve), "approve"));
+    $("tbl-approvals").querySelectorAll("[data-reject]").forEach(b => b.onclick = () => approvalReview(Number(b.dataset.reject), "reject"));
+  });
+}
+
+function approvalReview(approvalId, action) {
+  openModal({
+    title: action === "approve" ? "审批同意" : "审批驳回",
+    fields: [{ key: "comment", label: "审批意见（可选）", type: "textarea", span: 2,
+               placeholder: action === "approve" ? "如：口径无误，同意发布" : "如：口径待确认，请补充说明" }],
+    onOk: async (o) => {
+      await post(`/approvals/${approvalId}/${action}`, { comment: o.comment });
+      toast(action === "approve" ? "已同意，指标发布生效（PUBLISHED）" : "已驳回，实体保持原状态");
+      await refreshAll();
+    },
+  });
+}
+
+// ================================================================
+// 数据质量与监控：健康度总览 / 质量规则 / 手动检查 / 站内告警
+// ================================================================
+function renderQuality() {
+  renderHealth();
+  renderQualityRules();
+}
+
+function healthBadge(level) {
+  const cls = { green: "pub", yellow: "warn", red: "arch" }[level] || "";
+  return `<span class="badge status ${cls}">${HEALTH_LABEL[level] || level}</span>`;
+}
+
+function renderHealth() {
+  api("/quality/health").then(d => {
+    const s = d.summary || {};
+    $("health-cards").innerHTML = `
+      <div class="sum-card total"><b>${s.total ?? 0}</b><span>模型总数</span></div>
+      <div class="sum-card" style="border-left:3px solid #52c41a"><b style="color:#52c41a">${s.green ?? 0}</b><span>健康（绿）</span></div>
+      <div class="sum-card" style="border-left:3px solid #faad14"><b style="color:#faad14">${s.yellow ?? 0}</b><span>关注（黄）</span></div>
+      <div class="sum-card" style="border-left:3px solid #f5222d"><b style="color:#f5222d">${s.red ?? 0}</b><span>告警（红）</span></div>`;
+    $("tbl-health").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>物化状态</th><th>物化表</th><th>行数</th><th>最新分区</th><th>新鲜度</th><th>规则结果</th><th>健康度</th></tr></thead>
+      <tbody>${(d.items || []).map(m => `<tr>
+        <td><code>${esc(m.code)}</code></td><td>${esc(m.name)}</td>
+        <td>${m.materialized ? `<span class="badge status pub">已物化</span>` : `<span class="badge status arch">未物化</span>`}</td>
+        <td><code>${esc(m.physical_table || "-")}</code></td>
+        <td class="num">${fmt(m.row_count)}</td>
+        <td class="hint-text">${esc(m.latest_date || "-")}</td>
+        <td>${m.fresh_days === null || m.fresh_days === undefined ? '<span class="hint-text">-</span>'
+          : m.fresh_days > 7 ? `<span class="badge status arch">${m.fresh_days} 天</span>`
+          : m.fresh_days > 3 ? `<span class="badge status warn">${m.fresh_days} 天</span>`
+          : `<span class="badge status pub">${m.fresh_days} 天</span>`}</td>
+        <td>${m.rule_total ? `<span class="hint-text">通过 ${m.rule_total - m.rule_failed - m.rule_error} / 失败 ${m.rule_failed} / 异常 ${m.rule_error}</span>` : '<span class="hint-text">未配置</span>'}</td>
+        <td>${healthBadge(m.level)}</td>
+      </tr>`).join("") || `<tr><td colspan="9" class="empty">暂无下游模型</td></tr>`}</tbody>`;
+  });
+}
+
+function ruleParamsText(type, params) {
+  const p = params || {};
+  const map = {
+    row_count_min: `行数 ≥ ${p.min_rows}`,
+    row_count_change: `波动 ≤ ${p.max_change_pct}%`,
+    non_null_rate: `${p.column} 非空率 ≥ ${p.min_rate}%`,
+    fresh_days: `最新数据 ≤ ${p.max_days} 天`,
+  };
+  return map[type] || JSON.stringify(p);
+}
+
+function ruleResultBadge(r) {
+  if (!r.last_result) return '<span class="hint-text">未检查</span>';
+  const cls = { ok: "pub", fail: "warn", error: "arch" }[r.last_result] || "";
+  const label = { ok: "通过", fail: "失败", error: "异常" }[r.last_result] || r.last_result;
+  return `<span class="badge status ${cls}">${label}</span><span class="hint-text" style="margin-left:6px">${esc(r.last_value ?? "")}${r.last_message ? " " + esc(r.last_message) : ""}</span>`;
+}
+
+function renderQualityRules() {
+  api("/quality-rules").then(d => {
+    $("tbl-quality").innerHTML = `<thead><tr><th>目标模型</th><th>规则类型</th><th>参数</th><th>级别</th><th>状态</th><th>最近检查</th><th>最近结果</th><th style="width:230px">操作</th></tr></thead>
+      <tbody>${(d.items || []).map(r => `<tr>
+        <td><code>${esc(r.entity_code)}</code></td>
+        <td>${RULE_TYPE_LABEL[r.rule_type] || r.rule_type}</td>
+        <td class="hint-text">${esc(ruleParamsText(r.rule_type, r.params))}</td>
+        <td>${r.severity === "critical" ? `<span class="badge status arch">critical</span>` : `<span class="badge soft">${r.severity}</span>`}</td>
+        <td>${r.enabled ? `<span class="badge status pub">启用</span>` : `<span class="badge soft">停用</span>`}</td>
+        <td class="hint-text">${esc(r.last_check_at || "-")}</td>
+        <td>${ruleResultBadge(r)}</td>
+        <td>
+          <button class="btn-ghost btn-sm" data-act="check" data-id="${r.id}">检查</button>
+          <button class="btn-ghost btn-sm" data-act="edit" data-id="${r.id}">编辑</button>
+          <button class="btn-ghost btn-sm" data-act="toggle" data-id="${r.id}">${r.enabled ? "停用" : "启用"}</button>
+          <button class="btn-ghost btn-sm danger" data-act="del" data-id="${r.id}">删除</button>
+        </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无质量规则（物化 / 重导成功会自动执行已启用规则）</td></tr>`}</tbody>`;
+    $("tbl-quality").querySelectorAll("[data-act='check']").forEach(b => b.onclick = async () => {
+      const id = Number(b.dataset.id);
+      try {
+        const d = await post(`/quality-rules/${id}/check`);
+        toast(`检查完成：${d.result}（${d.value ?? ""} ${d.message || ""}）`, d.result === "ok");
+        renderQualityRules();
+        renderHealth();
+      } catch (e) { toast(e.message, false); }
+    });
+    $("tbl-quality").querySelectorAll("[data-act='edit']").forEach(b => b.onclick = () => qualityRuleForm(Number(b.dataset.id)));
+    $("tbl-quality").querySelectorAll("[data-act='toggle']").forEach(b => b.onclick = async () => {
+      try {
+        const d = await post(`/quality-rules/${b.dataset.id}/toggle`);
+        toast(d.enabled ? "规则已启用" : "规则已停用");
+        renderQualityRules();
+      } catch (e) { toast(e.message, false); }
+    });
+    $("tbl-quality").querySelectorAll("[data-act='del']").forEach(b => b.onclick = () => confirmDelete("删除该质量规则？", () => del(`/quality-rules/${b.dataset.id}`)));
+  });
+}
+
+// 质量规则表单：规则类型切换时动态渲染参数区（rule-params-zone）
+async function qualityRuleForm(ruleId) {
+  let v = { entity_id: "", rule_type: "row_count_min", severity: "warning", enabled: 1, params: {} };
+  if (ruleId) {
+    const r = (await api("/quality-rules")).items.find(x => x.id === ruleId);
+    if (r) v = { entity_id: r.entity_id, rule_type: r.rule_type, severity: r.severity, enabled: r.enabled ? 1 : 0, params: r.params || {} };
+  }
+  openModal({
+    title: ruleId ? "编辑质量规则" : "新建质量规则",
+    fields: [
+      { key: "entity_id", label: "目标模型（下游模型）", type: "select", required: true, options: DOWNSTREAMS.map(d => ({ value: d.id, label: `${d.code}（${d.name}）` })) },
+      { key: "rule_type", label: "规则类型", type: "select", required: true, options: Object.entries(RULE_TYPE_LABEL).map(([k, l]) => ({ value: k, label: l })) },
+      { key: "severity", label: "级别", type: "select", options: [{ value: "warning", label: "warning（失败 → 黄色关注）" }, { value: "critical", label: "critical（失败 → 红色告警）" }] },
+      { key: "enabled", label: "启用状态", type: "select", options: [{ value: 1, label: "启用（物化/重导后自动检查）" }, { value: 0, label: "停用" }] },
+    ],
+    value: v,
+    hint: "检查方式：物化表 COUNT / COUNT(列非空) / MAX(最新分区) 新鲜度；模型未物化时检查返回「异常」",
+    onOk: async (o) => {
+      const params = {};
+      for (const p of RULE_TYPE_PARAMS[o.rule_type] || []) {
+        const el = document.getElementById("p-" + p.key);
+        let val = el ? el.value.trim() : "";
+        if (p.type === "number") {
+          val = Number(val);
+          if (isNaN(val)) throw new Error(`请填写参数「${p.label}」`);
+        } else if (!val) throw new Error(`请填写参数「${p.label}」`);
+        params[p.key] = val;
+      }
+      const body = { entity_id: Number(o.entity_id), rule_type: o.rule_type, params, severity: o.severity, enabled: Number(o.enabled) };
+      if (ruleId) await put(`/quality-rules/${ruleId}`, body);
+      else await post("/quality-rules", body);
+      await refreshAll();
+    },
+  });
+  const zone = document.createElement("div");
+  zone.id = "rule-params-zone";
+  $("modal-body").appendChild(zone);
+  const buildParams = () => {
+    const type = $("f-rule_type").value;
+    zone.innerHTML = `<div class="form-grid" style="margin-top:12px">${RULE_TYPE_PARAMS[type].map(p => `
+      <div class="field"><label>${p.label} *</label>
+        <input id="p-${p.key}" type="${p.type === "number" ? "number" : "text"}" placeholder="${esc(p.placeholder)}" value="${esc(v.params[p.key] ?? "")}"></div>`).join("")}</div>`;
+  };
+  buildParams();
+  $("f-rule_type").onchange = buildParams;
+}
+
+// ================================================================
+// 调度与运维：周期调度 / 任务实例 / 失败重试
+// ================================================================
+function renderOps() {
+  renderSchedules();
+  renderTaskInstances();
+}
+
+function renderSchedules() {
+  api("/schedules").then(d => {
+    $("tbl-schedules").innerHTML = `<thead><tr><th>目标模型</th><th>调度类型</th><th>执行动作</th><th>状态</th><th>上次执行</th><th>下次执行</th><th style="width:230px">操作</th></tr></thead>
+      <tbody>${(d.items || []).map(s => `<tr>
+        <td><code>${esc(s.entity_code)}</code></td>
+        <td>${s.schedule_type === "daily" ? `每天 ${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")}` : `每 ${s.interval_minutes} 分钟`}</td>
+        <td>${s.action === "materialize" ? `<span class="tag">物化</span>` : `<span class="tag agg">重导</span>`}</td>
+        <td>${s.enabled ? `<span class="badge status pub">启用</span>` : `<span class="badge soft">停用</span>`}</td>
+        <td class="hint-text">${esc(s.last_run_at || "-")}</td>
+        <td class="hint-text">${esc(s.next_run_at || "-")}</td>
+        <td>
+          <button class="btn-ghost btn-sm" data-act="run" data-id="${s.id}">立即执行</button>
+          <button class="btn-ghost btn-sm" data-act="edit" data-id="${s.id}">编辑</button>
+          <button class="btn-ghost btn-sm" data-act="toggle" data-id="${s.id}">${s.enabled ? "停用" : "启用"}</button>
+          <button class="btn-ghost btn-sm danger" data-act="del" data-id="${s.id}">删除</button>
+        </td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无调度配置</td></tr>`}</tbody>`;
+    $("tbl-schedules").querySelectorAll("[data-act='run']").forEach(b => b.onclick = async () => {
+      const id = Number(b.dataset.id);
+      try {
+        const d = await post(`/schedules/${id}/run`);
+        toast(d.status === "SUCCESS" ? "执行成功，已自动触发质量检查" : `执行完成：${d.status}`, d.status === "SUCCESS");
+        renderSchedules();
+        renderTaskInstances();
+      } catch (e) { toast(e.message, false); }
+    });
+    $("tbl-schedules").querySelectorAll("[data-act='edit']").forEach(b => b.onclick = () => scheduleForm(Number(b.dataset.id)));
+    $("tbl-schedules").querySelectorAll("[data-act='toggle']").forEach(b => b.onclick = async () => {
+      try {
+        const d = await post(`/schedules/${b.dataset.id}/toggle`);
+        toast(d.enabled ? "调度已启用" : "调度已停用");
+        renderSchedules();
+      } catch (e) { toast(e.message, false); }
+    });
+    $("tbl-schedules").querySelectorAll("[data-act='del']").forEach(b => b.onclick = () => confirmDelete("删除该调度配置？", () => del(`/schedules/${b.dataset.id}`)));
+  });
+}
+
+async function scheduleForm(id) {
+  let v = { entity_id: "", schedule_type: "daily", hour: 2, minute: 0, interval_minutes: 60, action: "materialize", enabled: 1 };
+  if (id) {
+    const r = (await api("/schedules")).items.find(x => x.id === id);
+    if (r) v = { ...v, ...r, enabled: r.enabled ? 1 : 0 };
+  }
+  openModal({
+    title: id ? "编辑调度配置" : "新建调度配置",
+    fields: [
+      { key: "entity_id", label: "目标模型", type: "select", required: true, options: DOWNSTREAMS.map(d => ({ value: d.id, label: `${d.code}（${d.name}）` })) },
+      { key: "schedule_type", label: "调度类型", type: "select", options: [{ value: "daily", label: "每天固定时间（daily）" }, { value: "interval", label: "固定间隔（interval）" }] },
+      { key: "hour", label: "小时（daily，0-23）", type: "number" },
+      { key: "minute", label: "分钟（daily，0-59）", type: "number" },
+      { key: "interval_minutes", label: "间隔分钟（interval）", type: "number" },
+      { key: "action", label: "执行动作", type: "select", options: [{ value: "materialize", label: "物化（生成 / 刷新物化表）" }, { value: "reimport", label: "重导（近 3 个月重算）" }] },
+      { key: "enabled", label: "启用状态", type: "select", options: [{ value: 1, label: "启用" }, { value: 0, label: "停用" }] },
+    ],
+    value: v,
+    hint: "后台调度器每 30 秒扫描一次到点任务并执行，成功自动触发质量检查；「立即执行」不依赖线程时序",
+    onOk: async (o) => {
+      const body = {
+        entity_id: Number(o.entity_id), schedule_type: o.schedule_type,
+        hour: o.schedule_type === "daily" ? Number(o.hour) : 0,
+        minute: o.schedule_type === "daily" ? Number(o.minute) : 0,
+        interval_minutes: o.schedule_type === "interval" ? Number(o.interval_minutes) : 60,
+        action: o.action, enabled: Number(o.enabled),
+      };
+      if (body.hour > 23 || body.hour < 0) throw new Error("小时需在 0-23");
+      if (body.minute > 59 || body.minute < 0) throw new Error("分钟需在 0-59");
+      if (body.interval_minutes < 1) throw new Error("间隔需 ≥ 1 分钟");
+      if (id) await put(`/schedules/${id}`, body);
+      else await post("/schedules", body);
+      await refreshAll();
+    },
+  });
+}
+
+function taskStatusBadge(s) {
+  const cls = { SUCCESS: "pub", FAILED: "arch", RUNNING: "", PENDING: "", SKIPPED: "" }[s] || "";
+  return `<span class="badge status ${cls}">${TASK_STATUS_LABEL[s] || s}</span>`;
+}
+
+function taskInstanceResult(i) {
+  if (i.error) return "失败：" + i.error;
+  const d = i.detail || {};
+  if (d.row_count !== undefined) return `写入 ${fmt(d.row_count)} 行`;
+  if (d.result) return `${d.result}（${d.value ?? ""} ${d.message || ""}）`;
+  if (d.message) return d.message;
+  return "-";
+}
+
+function renderTaskInstances() {
+  const tt = $("ti-type").value, st = $("ti-status").value;
+  api(`/task-instances?page=1&page_size=100${tt ? "&task_type=" + tt : ""}${st ? "&status=" + st : ""}`).then(d => {
+    $("tbl-task-instances").innerHTML = `<thead><tr><th>ID</th><th>任务</th><th>对象</th><th>触发</th><th>状态</th><th>开始</th><th>结束</th><th>结果</th><th style="width:110px">操作</th></tr></thead>
+      <tbody>${(d.items || []).map(i => `<tr>
+        <td class="num">${i.id}</td>
+        <td>${TASK_TYPE_LABEL[i.task_type] || i.task_type}</td>
+        <td><code>${esc(i.entity_code || "-")}</code></td>
+        <td>${TRIGGER_LABEL[i.trigger] || i.trigger}</td>
+        <td>${taskStatusBadge(i.status)}</td>
+        <td class="hint-text">${esc(i.started_at || "-")}</td>
+        <td class="hint-text">${esc(i.finished_at || "-")}</td>
+        <td class="hint-text" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(taskInstanceResult(i))}">${esc(taskInstanceResult(i))}</td>
+        <td>
+          <button class="btn-ghost btn-sm" data-act="detail" data-id="${i.id}">详情</button>
+          ${i.status === "FAILED" ? `<button class="btn-ghost btn-sm" data-act="retry" data-id="${i.id}">重试</button>` : ""}
+        </td></tr>`).join("") || `<tr><td colspan="9" class="empty">暂无任务实例（物化 / 重导 / 质量检查会自动记录）</td></tr>`}</tbody>`;
+    $("tbl-task-instances").querySelectorAll("[data-act='detail']").forEach(b => b.onclick = () => taskInstanceDetail(Number(b.dataset.id)).catch(e => toast(e.message, false)));
+    $("tbl-task-instances").querySelectorAll("[data-act='retry']").forEach(b => b.onclick = () => retryTask(Number(b.dataset.id)));
+  });
+}
+
+async function taskInstanceDetail(id) {
+  const i = await api(`/task-instances/${id}`);
+  openModal({
+    title: `任务实例 #${i.id} · ${TASK_TYPE_LABEL[i.task_type] || i.task_type}`,
+    width: 700,
+    fields: [
+      { key: "_base", label: "基本信息", type: "pre", span: 2 },
+      { key: "_detail", label: "执行明细（JSON）", type: "pre", span: 2 },
+      { key: "_error", label: "错误信息", type: "pre", span: 2 },
+    ],
+    value: {
+      _base: `对象：${i.entity_code || "-"}（${ENTITY_TYPE_LABEL[i.entity_type] || i.entity_type}）
+触发：${TRIGGER_LABEL[i.trigger] || i.trigger}    状态：${TASK_STATUS_LABEL[i.status] || i.status}
+开始：${i.started_at || "-"}    结束：${i.finished_at || "-"}`,
+      _detail: JSON.stringify(i.detail || {}, null, 2),
+      _error: i.error || "（无）",
+    },
+    onOk: async () => {},
+  });
+  $("modal-ok").style.display = "none";
+  $("modal-cancel").textContent = "关 闭";
+}
+
+// 失败任务重试（按实例类型与参数重放；质量检查返回 {status:"ok", result...}）
+async function retryTask(id) {
+  if (!window.confirm("重试该任务？将按实例类型与参数重新执行")) return;
+  try {
+    const d = await post(`/task-instances/${id}/retry`);
+    const okFlag = d.status !== "FAILED";
+    toast(d.status === "ok" ? `重试完成：${d.result}（${d.message || ""}）` : `重试执行：${TASK_STATUS_LABEL[d.status] || d.status}`, okFlag);
+    renderTaskInstances();
+    refreshAlertBadge();
+  } catch (e) { toast(e.message, false); }
+}
+
+// ================================================================
+// 站内告警（通知铃铛）
+// ================================================================
+async function refreshAlertBadge() {
+  const badge = $("alert-badge");
+  if (!badge) return;
+  try {
+    const d = await api("/alerts/unread-count");
+    badge.style.display = d.unread ? "" : "none";
+    badge.textContent = d.unread;
+  } catch { /* 后端不可用时静默 */ }
+}
+
+function alertLevelBadge(level) {
+  const cls = { info: "", warning: "warn", error: "arch" }[level] || "";
+  return `<span class="badge status ${cls}">${ALERT_LEVEL_LABEL[level] || level}</span>`;
+}
+
+async function renderAlertList() {
+  const list = $("alert-list");
+  if (!list) return;
+  const d = await api("/alerts?page=1&page_size=30");
+  list.innerHTML = (d.items || []).map(a => `<div class="alert-item ${a.read ? "" : "unread"}" data-alert="${a.id}">
+      ${alertLevelBadge(a.level)}
+      <div class="alert-main">
+        <div class="alert-msg">${esc(a.message)}</div>
+        <div class="alert-time">${esc(a.created_at)}</div>
+      </div>
+      ${a.read ? "" : '<span class="alert-dot"></span>'}
+    </div>`).join("") || '<div class="alert-empty">暂无通知</div>';
+  list.querySelectorAll("[data-alert]").forEach(el => el.onclick = async () => {
+    const id = Number(el.dataset.alert);
+    try {
+      await post(`/alerts/${id}/read`);
+      await renderAlertList();
+      await refreshAlertBadge();
+    } catch (e) { /* 静默 */ }
+  });
+}
+
+function toggleAlertDropdown() {
+  const dd = $("alert-dropdown");
+  if (!dd) return;
+  dd.classList.toggle("open");
+  if (dd.classList.contains("open")) renderAlertList().catch(() => {});
+}
+
 // ---------------------------------------------------------------- 数据集
 const DS_TYPE_LABEL = { downstream_model: "物化表", metric_query: "指标实时查询" };
 
@@ -1393,7 +2015,7 @@ function renderApps() {
         <td><code>${esc(x.code)}</code></td>
         <td>${esc(x.name)}</td>
         <td class="key-mono">${esc(x.appkey)} <button class="btn-ghost btn-sm" data-copy="${esc(x.appkey)}">复制</button></td>
-        <td class="key-mono">${esc(x.appsecret.slice(0, 10))}… <button class="btn-ghost btn-sm" data-copy="${esc(x.appsecret)}">复制</button></td>
+        <td class="hint-text">仅创建/重置时可见</td>
         <td>${x.status === "ENABLED" ? `<span class="badge status pub">启用</span>` : `<span class="badge status arch">停用</span>`}</td>
         <td class="num">${x.call_count}</td>
         <td class="num">${x.dataset_count}</td>
@@ -1423,6 +2045,7 @@ async function appForm(id) {
         await put(`/downstream-apps/${id}`, o);
       } else {
         const d = await post("/downstream-apps", o);
+        APP_SECRETS[d.id] = d.appsecret;
         showCredentials(d.appkey, d.appsecret);
       }
       await refreshAll();
@@ -1455,6 +2078,7 @@ function showCredentials(appkey, appsecret) {
 
 async function appResetSecret(id) {
   const d = await post(`/downstream-apps/${id}/reset-secret`);
+  APP_SECRETS[id] = d.appsecret;
   showCredentials(d.appkey, d.appsecret);
   await refreshAll();
 }
@@ -1490,15 +2114,22 @@ async function loadDemoDatasets() {
   updateDemoCurl();
 }
 
+function demoSecretFor(app) {
+  if (!app) return "";
+  return APP_SECRETS[app.id] || ($("demo-secret") && $("demo-secret").value) || "";
+}
+
 function updateDemoCurl() {
   const app = APPS.find(a => a.id === Number($("demo-app").value));
   const code = $("demo-dataset").value;
   const limit = $("demo-limit").value || 20;
   if (!app || !code) { $("demo-curl").textContent = "// 选择应用与数据集后自动生成调用示例"; return; }
+  const secret = demoSecretFor(app);
+  if ($("demo-secret") && APP_SECRETS[app.id] && !$("demo-secret").value) $("demo-secret").value = APP_SECRETS[app.id];
   $("demo-curl").textContent =
 `# 下游系统调用示例（数据集 ${code}，AppKey=${app.appkey.slice(0, 8)}…）
 curl -s -H "X-App-Key: ${app.appkey}" \\
-     -H "X-App-Secret: ${app.appsecret}" \\
+     -H "X-App-Secret: ${secret || "<AppSecret>"}" \\
      "http://127.0.0.1:8000/openapi/v1/datasets/${code}/data?page=1&page_size=${limit}"`;
 }
 
@@ -1507,9 +2138,11 @@ async function callDemo() {
   const code = $("demo-dataset").value;
   const limit = $("demo-limit").value || 20;
   if (!app || !code) { toast("请选择应用与数据集", false); return; }
+  const secret = demoSecretFor(app);
+  if (!secret) { toast("请先创建/重置应用以获取 AppSecret，或在输入框粘贴", false); return; }
   try {
     const r = await fetch(`/openapi/v1/datasets/${encodeURIComponent(code)}/data?page=1&page_size=${limit}`, {
-      headers: { "X-App-Key": app.appkey, "X-App-Secret": app.appsecret },
+      headers: { "X-App-Key": app.appkey, "X-App-Secret": secret },
     });
     const body = await r.json();
     $("demo-result").textContent = JSON.stringify(body, null, 2);
@@ -1666,10 +2299,18 @@ function bindEvents() {
     const id = Number(btn.dataset.id);
     if (btn.dataset.act === "edit") atomicForm(id);
     else if (btn.dataset.act === "del") confirmDelete("删除该原子指标？", () => del(`/atomic-metrics/${id}`));
+    else if (btn.dataset.act === "versions") versionsModal("atomic_metric", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "impact") impactModal("atomic_metric", id).catch(err => toast(err.message, false));
     else if (btn.dataset.act === "status") {
       const cur = (META.atomic.find(m => m.id === id) || {}).status;
-      const next = cur === "PUBLISHED" ? "ARCHIVED" : "PUBLISHED";
-      post(`/atomic-metrics/${id}/status`, { status: next }).then(refreshAll).catch(e => toast(e.message, false));
+      if (cur === "PUBLISHED") {
+        // 已发布 → 直接归档（现有行为不变）
+        post(`/atomic-metrics/${id}/status`, { status: "ARCHIVED" }).then(refreshAll).catch(e => toast(e.message, false));
+      } else {
+        // 草稿/已归档 → 提交发布走审批流
+        const m = META.atomic.find(m => m.id === id) || {};
+        submitApproval("atomic_metric", id, m.name || "");
+      }
     }
   });
 
@@ -1682,6 +2323,8 @@ function bindEvents() {
     if (btn.dataset.act === "attrs") attrManager(id);
     else if (btn.dataset.act === "edit") dimForm(id);
     else if (btn.dataset.act === "del") confirmDelete("删除该维度？", () => del(`/dimensions/${id}`));
+    else if (btn.dataset.act === "versions") versionsModal("dimension", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "impact") impactModal("dimension", id).catch(err => toast(err.message, false));
   });
 
   // 派生
@@ -1695,6 +2338,8 @@ function bindEvents() {
     else if (btn.dataset.act === "sql") {
       api(`/derived-metrics/${id}/sql-preview`).then(d => sqlPreviewModal(`SQL 预览 · ${d.metric_name}`, d.sql, d.params)).catch(e => toast(e.message, false));
     }
+    else if (btn.dataset.act === "versions") versionsModal("derived_metric", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "impact") impactModal("derived_metric", id).catch(err => toast(err.message, false));
   });
 
   // 复合
@@ -1708,6 +2353,8 @@ function bindEvents() {
     else if (btn.dataset.act === "sql") {
       api(`/composite-metrics/${id}/sql-preview`).then(d => sqlPreviewModal("SQL 预览 · " + d.metric_name, d.sql, d.params)).catch(e => toast(e.message, false));
     }
+    else if (btn.dataset.act === "versions") versionsModal("composite_metric", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "impact") impactModal("composite_metric", id).catch(err => toast(err.message, false));
   });
 
   // 逻辑模型
@@ -1721,6 +2368,8 @@ function bindEvents() {
     else if (btn.dataset.act === "sql") {
       api(`/logical-models/${id}`).then(d => sqlPreviewModal("逻辑模型 SQL · " + d.name, d.generated_sql)).catch(e => toast(e.message, false));
     }
+    else if (btn.dataset.act === "versions") versionsModal("logical_model", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "impact") impactModal("logical_model", id).catch(err => toast(err.message, false));
   });
 
   // 下游模型
@@ -1784,6 +2433,7 @@ function bindEvents() {
   // 开放 API：调用演示
   $("btn-demo-call").onclick = callDemo;
   $("demo-limit").addEventListener("change", updateDemoCurl);
+  if ($("demo-secret")) $("demo-secret").addEventListener("input", updateDemoCurl);
 
   // 血缘
   $("lineage-select").onchange = renderLineage;
@@ -1794,6 +2444,36 @@ function bindEvents() {
   ["domains", "processes", "atomics", "dims", "derived", "composites", "downstreams", "datasets", "apps"].forEach(tab => {
     const el = $("kw-" + tab);
     el.addEventListener("keydown", e => { if (e.key === "Enter") switchTab(tab); });
+  });
+
+  // 审批中心：待办 / 历史切换
+  document.querySelectorAll("#approval-seg .seg-item").forEach(b =>
+    b.onclick = () => { APPROVAL_VIEW = b.dataset.view; renderApprovals(); });
+
+  // 质量监控
+  $("btn-health-refresh").onclick = () => { renderHealth(); renderQualityRules(); };
+  $("btn-new-quality").onclick = listenerWrap(() => qualityRuleForm(null));
+
+  // 任务运维
+  $("btn-new-schedule").onclick = listenerWrap(() => scheduleForm(null));
+  $("btn-ti-refresh").onclick = renderTaskInstances;
+  $("ti-type").onchange = renderTaskInstances;
+  $("ti-status").onchange = renderTaskInstances;
+
+  // 通知铃铛：点击开合（阻止冒泡，点击外部关闭）
+  $("btn-alerts").onclick = e => { e.stopPropagation(); toggleAlertDropdown(); };
+  $("btn-alerts-read-all").onclick = async e => {
+    e.stopPropagation();
+    try {
+      const d = await post("/alerts/read-all");
+      toast(`已读 ${d.updated} 条通知`);
+      await renderAlertList();
+      await refreshAlertBadge();
+    } catch (err) { toast(err.message, false); }
+  };
+  document.addEventListener("click", e => {
+    const dd = $("alert-dropdown");
+    if (dd && dd.classList.contains("open") && !e.target.closest(".bell-wrap")) dd.classList.remove("open");
   });
 }
 
