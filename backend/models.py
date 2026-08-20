@@ -15,7 +15,7 @@ from pathlib import Path
 
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Date, JSON, Text,
-    ForeignKey, UniqueConstraint, create_engine,
+    ForeignKey, UniqueConstraint, Index, create_engine,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
@@ -249,6 +249,10 @@ class AppDatasetGrant(Base):
     id = Column(Integer, primary_key=True)
     app_id = Column(Integer, ForeignKey("meta_downstream_app.id"), nullable=False)
     dataset_id = Column(Integer, ForeignKey("meta_dataset.id"), nullable=False)
+    __table_args__ = (
+        # 同一应用对同一数据集只允许一条授权
+        UniqueConstraint("app_id", "dataset_id", name="uq_app_dataset"),
+    )
 
 
 class ApiCallLog(Base):
@@ -261,6 +265,9 @@ class ApiCallLog(Base):
     row_count = Column(Integer, default=0)
     duration_ms = Column(Integer, default=0)
     status = Column(String(32), default="success")    # success / 错误信息摘要
+    __table_args__ = (
+        Index("ix_api_log_app_called", "app_id", "called_at"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +308,9 @@ class DwdOrderDetail(Base):
     user_id = Column(Integer)
     order_amount = Column(Float, nullable=False)
     order_status = Column(String(16), default="PAID")
+    __table_args__ = (
+        Index("ix_dwd_order_date", "order_date"),
+    )
 
 
 class DwdPayDetail(Base):
@@ -314,6 +324,9 @@ class DwdPayDetail(Base):
     user_id = Column(Integer)
     pay_amount = Column(Float, nullable=False)
     pay_channel = Column(String(16), default="WECHAT")
+    __table_args__ = (
+        Index("ix_dwd_pay_date", "pay_date"),
+    )
 
 
 class DwdRefundDetail(Base):
@@ -327,6 +340,9 @@ class DwdRefundDetail(Base):
     pay_id = Column(String(32))
     refund_amount = Column(Float, nullable=False)
     refund_reason = Column(String(32), default="质量原因")
+    __table_args__ = (
+        Index("ix_dwd_refund_date", "refund_date"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +363,9 @@ class MetricVersion(Base):
     change_type = Column(String(16), default="update") # update/status/approve/rollback
     change_note = Column(String(256), default="")
     created_at = Column(DateTime, default=now)
+    __table_args__ = (
+        Index("ix_metric_version_entity", "entity_type", "entity_id"),
+    )
 
 
 class Approval(Base):
@@ -362,6 +381,10 @@ class Approval(Base):
     comment = Column(String(512), default="")          # 审批意见
     created_at = Column(DateTime, default=now)
     reviewed_at = Column(DateTime)
+    __table_args__ = (
+        Index("ix_approval_entity", "entity_type", "entity_id"),
+        Index("ix_approval_status", "status"),
+    )
 
 
 class QualityRule(Base):
@@ -379,6 +402,10 @@ class QualityRule(Base):
     last_value = Column(String(64))                    # 最近一次校验结果值（如行数/波动%）
     last_message = Column(String(256), default="")
     created_at = Column(DateTime, default=now)
+    __table_args__ = (
+        Index("ix_quality_rule_entity", "entity_type", "entity_id"),
+        Index("ix_quality_rule_enabled", "enabled"),
+    )
 
 
 class Alert(Base):
@@ -391,6 +418,10 @@ class Alert(Base):
     message = Column(String(512), nullable=False)
     read = Column(Integer, default=0)
     created_at = Column(DateTime, default=now)
+    __table_args__ = (
+        Index("ix_alert_read", "read"),
+        Index("ix_alert_source", "source_type", "source_id"),
+    )
 
 
 class TaskInstance(Base):
@@ -407,6 +438,10 @@ class TaskInstance(Base):
     error = Column(Text, default="")                   # 失败原因
     started_at = Column(DateTime, default=now)
     finished_at = Column(DateTime)
+    __table_args__ = (
+        Index("ix_task_entity", "entity_type", "entity_id"),
+        Index("ix_task_status", "status"),
+    )
 
 
 class Schedule(Base):
@@ -423,6 +458,9 @@ class Schedule(Base):
     last_run_at = Column(DateTime)
     next_run_at = Column(DateTime)
     created_at = Column(DateTime, default=now)
+    __table_args__ = (
+        Index("ix_schedule_enabled", "enabled"),
+    )
 
 
 class EntityTag(Base):

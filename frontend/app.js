@@ -427,6 +427,7 @@ const TITLES = {
 
 function switchTab(tab) {
   CURRENT_TAB = tab;
+  closeAlertDropdown(); // 切换页签时收起通知下拉
   document.querySelectorAll(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.tab === tab));
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + tab));
   const [t, s] = TITLES[tab];
@@ -519,7 +520,7 @@ function renderTable(el, cols, rows) {
   const head = `<thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>`;
   const body = rows.map(r => `<tr>${r.map((v, i) => {
     const cls = typeof v === "number" ? "num" : "";
-    return `<td class="${cls}">${fmt(v)}</td>`;
+    return `<td class="${cls}">${esc(fmt(v))}</td>`;
   }).join("")}</tr>`).join("");
   el.innerHTML = head + `<tbody>${body || `<tr><td colspan="${Math.max(cols.length, 1)}" class="empty">无数据</td></tr>`}</tbody>`;
 }
@@ -552,7 +553,7 @@ function renderChart(cols, rows, nMetrics, el) {
       const y = y0 + i * (barH + barGap);
       const w = max ? (W - pad - 80) * (v / max) : 0;
       svg.push(`<rect x="${pad}" y="${y}" width="${Math.max(w, 2)}" height="${barH}" rx="3" fill="${colors[i]}"/>`);
-      svg.push(`<text x="${pad + Math.max(w, 2) + 6}" y="${y + barH / 2}" dominant-baseline="central" font-size="11" fill="#1e293b">${fmt(v)}</text>`);
+      svg.push(`<text x="${pad + Math.max(w, 2) + 6}" y="${y + barH / 2}" dominant-baseline="central" font-size="11" fill="#1e293b">${esc(fmt(v))}</text>`);
     });
   });
   svg.push("</svg>");
@@ -1831,8 +1832,8 @@ async function renderAlertList() {
     const id = Number(el.dataset.alert);
     try {
       await post(`/alerts/${id}/read`);
-      await renderAlertList();
       await refreshAlertBadge();
+      closeAlertDropdown(); // 点击通知后关闭下拉（避免一直保留在页面上）
     } catch (e) { /* 静默 */ }
   });
 }
@@ -1842,6 +1843,11 @@ function toggleAlertDropdown() {
   if (!dd) return;
   dd.classList.toggle("open");
   if (dd.classList.contains("open")) renderAlertList().catch(() => {});
+}
+
+function closeAlertDropdown() {
+  const dd = $("alert-dropdown");
+  if (dd) dd.classList.remove("open");
 }
 
 // ---------------------------------------------------------------- 数据集
@@ -2462,6 +2468,7 @@ function bindEvents() {
 
   // 通知铃铛：点击开合（阻止冒泡，点击外部关闭）
   $("btn-alerts").onclick = e => { e.stopPropagation(); toggleAlertDropdown(); };
+  $("btn-alerts-close").onclick = e => { e.stopPropagation(); closeAlertDropdown(); };
   $("btn-alerts-read-all").onclick = async e => {
     e.stopPropagation();
     try {
@@ -2473,7 +2480,10 @@ function bindEvents() {
   };
   document.addEventListener("click", e => {
     const dd = $("alert-dropdown");
-    if (dd && dd.classList.contains("open") && !e.target.closest(".bell-wrap")) dd.classList.remove("open");
+    if (dd && dd.classList.contains("open") && !e.target.closest(".bell-wrap")) closeAlertDropdown();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") closeAlertDropdown();
   });
 }
 

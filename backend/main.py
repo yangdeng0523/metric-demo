@@ -29,7 +29,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, text
 
 from models import (
@@ -145,6 +145,21 @@ def _metric_sql(code: str, start_date=None, end_date=None):
     return mtype, sql, {k: str(v) for k, v in params.items()}
 
 
+def _page_clamped(page: int) -> int:
+    """分页参数安全化：page 至少为 1，防止负偏移"""
+    return max(1, int(page or 1))
+
+
+def _page_size_clamped(page_size: int) -> int:
+    """分页参数安全化：单页上限 200，防止超大页拖垮查询"""
+    return min(200, max(1, int(page_size or 20)))
+
+
+def _like_escape(kw: str) -> str:
+    """LIKE 通配符转义，避免用户输入的 %/_ 放大匹配范围"""
+    return (kw or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 # ---------------------------------------------------------------------------
 # 治理与运维辅助：编码规范 / 版本快照 / 标签 / 告警
 # ---------------------------------------------------------------------------
@@ -224,11 +239,29 @@ def _set_tags(s, entity_type: str, entity_id: int, tags: list):
 
 
 def _purge_entity_artifacts(s, entity_type: str, entity_id: int):
-    """删除实体时清理其治理/质量关联数据（版本、审批、标签、质量规则），
-    避免 SQLite 复用自增 id 后旧记录挂到新实体上"""
+    """删除实体时清理其治理/质量/运维关联数据（版本、审批、标签、质量规则、
+    告警、任务实例、数据集删除时的调用日志），避免 SQLite 复用自增 id 后
+    旧记录挂到新实体上"""
     for model in (MetricVersion, Approval, EntityTag, QualityRule):
         s.query(model).filter_by(entity_type=entity_type,
                                  entity_id=entity_id).delete()
+    # 告警按来源关联（质量规则告警 source_id=规则 id；任务告警 source_id=实例 id）
+    if entity_type == "downstream_model":
+        rule_ids = [r.id for r in
+                    s.query(QualityRule.id).filter_by(entity_id=entity_id)]
+        inst_ids = [i.id for i in
+                    s.query(TaskInstance.id)
+                    .filter_by(entity_type="downstream_model", entity_id=entity_id)]
+        if rule_ids:
+            s.query(Alert).filter(
+                Alert.source_type == "quality",
+                Alert.source_id.in_(rule_ids)).delete(synchronize_session=False)
+        if inst_ids:
+            s.query(Alert).filter(
+                Alert.source_type == "task",
+                Alert.source_id.in_(inst_ids)).delete(synchronize_session=False)
+        s.query(TaskInstance).filter_by(entity_type=entity_type,
+                                        entity_id=entity_id).delete()
 
 
 def _new_alert(s, level: str, source_type: str, source_id, message: str):
@@ -241,80 +274,80 @@ def _new_alert(s, level: str, source_type: str, source_id, message: str):
 # ---------------------------------------------------------------------------
 
 class DomainIn(BaseModel):
-    code: str
-    name: str
-    description: str = ""
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
+    description: str = Field("", max_length=2000)
     sort_order: int = 0
 
 
 class ProcessIn(BaseModel):
-    code: str
-    name: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
     domain_id: int
-    physical_table: str
-    date_field: str = "order_date"
-    description: str = ""
+    physical_table: str = Field(..., max_length=128)
+    date_field: str = Field("order_date", max_length=64)
+    description: str = Field("", max_length=2000)
 
 
 class AtomicIn(BaseModel):
-    code: str
-    name: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
     process_id: int
-    agg_function: str
-    physical_field: str
-    data_type: str = "DECIMAL"
-    unit: str = ""
-    description: str = ""
+    agg_function: str = Field(..., max_length=32)
+    physical_field: str = Field(..., max_length=128)
+    data_type: str = Field("DECIMAL", max_length=32)
+    unit: str = Field("", max_length=64)
+    description: str = Field("", max_length=2000)
     status: str = STATUS_DRAFT
 
 
 class DimensionIn(BaseModel):
-    code: str
-    name: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
     domain_id: int
-    physical_table: str
-    join_field: str
-    name_field: str
-    description: str = ""
+    physical_table: str = Field(..., max_length=128)
+    join_field: str = Field(..., max_length=128)
+    name_field: str = Field(..., max_length=128)
+    description: str = Field("", max_length=2000)
 
 
 class AttrIn(BaseModel):
-    code: str
-    name: str
-    physical_field: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
+    physical_field: str = Field(..., max_length=128)
     data_type: str = "STRING"
 
 
 class DerivedIn(BaseModel):
-    code: str
-    name: str
-    atomic_code: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
+    atomic_code: str = Field(..., max_length=64)
     time_period: str = "7d"
     dim_codes: list = []
     filters: list = []
-    description: str = ""
+    description: str = Field("", max_length=2000)
     status: str = STATUS_PUBLISHED
 
 
 class CompositeIn(BaseModel):
-    code: str
-    name: str
-    expression: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
+    expression: str = Field(..., max_length=1000)
     ref_codes: list
-    data_type: str = "DECIMAL"
-    unit: str = ""
-    description: str = ""
+    data_type: str = Field("DECIMAL", max_length=32)
+    unit: str = Field("", max_length=64)
+    description: str = Field("", max_length=2000)
     status: str = STATUS_PUBLISHED
 
 
 class LogicalModelIn(BaseModel):
-    code: str
-    name: str
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
     domain_id: int
-    physical_table: str
+    physical_table: str = Field(..., max_length=128)
     join_type: str = "SINGLE"
     join_config: list = []
-    description: str = ""
+    description: str = Field("", max_length=2000)
 
 
 class StatusIn(BaseModel):
@@ -353,11 +386,12 @@ def list_domains(page: int = 1, page_size: int = 20, keyword: str = ""):
     try:
         q = s.query(SubjectDomain)
         if keyword:
-            q = q.filter(or_(SubjectDomain.code.like(f"%{keyword}%"),
-                             SubjectDomain.name.like(f"%{keyword}%")))
+            q = q.filter(or_(SubjectDomain.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             SubjectDomain.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         total = q.count()
         rows = (q.order_by(SubjectDomain.sort_order)
-                .offset((page - 1) * page_size).limit(page_size).all())
+                .offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = [{
             "id": d.id, "code": d.code, "name": d.name,
             "description": d.description, "sort_order": d.sort_order,
@@ -426,6 +460,7 @@ def create_process(body: ProcessIn):
     s = get_session()
     try:
         _check_code(s, BusinessProcess, body.code)
+        _check_code_rule(s, "business_process", body.code)
         _get_or_404(s, SubjectDomain, body.domain_id, "主题域")
         p = BusinessProcess(**body.dict())
         s.add(p)
@@ -443,8 +478,8 @@ def list_processes(domain_id: Optional[int] = None, keyword: str = ""):
         if domain_id:
             q = q.filter_by(domain_id=domain_id)
         if keyword:
-            q = q.filter(or_(BusinessProcess.code.like(f"%{keyword}%"),
-                             BusinessProcess.name.like(f"%{keyword}%")))
+            q = q.filter(or_(BusinessProcess.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             BusinessProcess.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         rows = q.order_by(BusinessProcess.id).all()
         items = [{
             "id": p.id, "code": p.code, "name": p.name,
@@ -483,6 +518,7 @@ def update_process(process_id: int, body: ProcessIn):
     try:
         p = _get_or_404(s, BusinessProcess, process_id, "业务过程")
         _check_code(s, BusinessProcess, body.code, exclude_id=process_id)
+        _check_code_rule(s, "business_process", body.code)
         _get_or_404(s, SubjectDomain, body.domain_id, "主题域")
         for k, v in body.dict().items():
             setattr(p, k, v)
@@ -541,11 +577,12 @@ def list_atomic_metrics(process_id: Optional[int] = None, status: Optional[str] 
         if status:
             q = q.filter_by(status=status)
         if keyword:
-            q = q.filter(or_(AtomicMetric.code.like(f"%{keyword}%"),
-                             AtomicMetric.name.like(f"%{keyword}%")))
+            q = q.filter(or_(AtomicMetric.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             AtomicMetric.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         total = q.count()
         rows = (q.order_by(AtomicMetric.id)
-                .offset((page - 1) * page_size).limit(page_size).all())
+                .offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         tags = _with_tags(s, "atomic_metric", [m.id for m in rows])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
@@ -668,8 +705,8 @@ def list_dimensions(domain_id: Optional[int] = None, keyword: str = ""):
         if domain_id:
             q = q.filter_by(domain_id=domain_id)
         if keyword:
-            q = q.filter(or_(Dimension.code.like(f"%{keyword}%"),
-                             Dimension.name.like(f"%{keyword}%")))
+            q = q.filter(or_(Dimension.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             Dimension.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         dims = q.order_by(Dimension.id).all()
         tags = _with_tags(s, "dimension", [d.id for d in dims])
         items = [{
@@ -678,8 +715,7 @@ def list_dimensions(domain_id: Optional[int] = None, keyword: str = ""):
             "physical_table": d.physical_table,
             "join_field": d.join_field, "name_field": d.name_field,
             "description": d.description,
-            "tags": [t.tag for t in s.query(EntityTag)
-                     .filter_by(entity_type="dimension", entity_id=d.id).all()],
+            "tags": tags.get(d.id, []),
             "attributes": [{"id": a.id, "code": a.code, "name": a.name,
                             "physical_field": a.physical_field,
                             "data_type": a.data_type}
@@ -743,6 +779,11 @@ def delete_dimension(dim_id: int):
                  if d.code in (dm.dim_codes or [])]
         if using:
             raise HTTPException(409, f"维度 {d.name} 被派生指标引用: {', '.join(using)}，禁止删除")
+        # 数据集以该维度作为统计维度时禁止删除（物化表按维度列展开）
+        ref_ds = [ds.code for ds in s.query(Dataset).all()
+                  if d.code in (ds.dim_codes or [])]
+        if ref_ds:
+            raise HTTPException(409, f"维度 {d.name} 被数据集引用: {', '.join(ref_ds)}，禁止删除")
         ds = _refs_in_downstream(s, dim_code=d.code)
         if ds:
             raise HTTPException(409, f"维度 {d.name} 被下游模型引用: {', '.join(ds)}，禁止删除")
@@ -834,11 +875,12 @@ def list_derived(atomic_id: Optional[int] = None, keyword: str = "",
         if atomic_id:
             q = q.filter_by(atomic_id=atomic_id)
         if keyword:
-            q = q.filter(or_(DerivedMetric.code.like(f"%{keyword}%"),
-                             DerivedMetric.name.like(f"%{keyword}%")))
+            q = q.filter(or_(DerivedMetric.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             DerivedMetric.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         total = q.count()
         rows = (q.order_by(DerivedMetric.id)
-                .offset((page - 1) * page_size).limit(page_size).all())
+                .offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         tags = _with_tags(s, "derived_metric", [m.id for m in rows])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
@@ -958,6 +1000,27 @@ def _check_refs(s, ref_codes: list):
             raise HTTPException(400, f"引用的派生指标不存在: {rc}")
 
 
+_EXPR_TOKEN_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*|\d+(\.\d+)?|[+\-*/()]|\s+")
+
+
+def _check_expression(expression: str, ref_codes: list):
+    """复合指标表达式白名单校验：仅允许引用指标 code、数字与 + - * / ( )。
+    防止表达式里混入表名/字段名/函数等注入 SQL 生成器"""
+    pos = 0
+    while pos < len(expression):
+        m = _EXPR_TOKEN_RE.match(expression, pos)
+        if not m:
+            raise HTTPException(400, f"计算表达式包含非法字符: {expression[pos]!r}")
+        tok = m.group()
+        if (not tok.isspace() and not tok.isdigit()
+                and not re.fullmatch(r"[+\-*/()]", tok) and tok not in ref_codes):
+            raise HTTPException(400, f"计算表达式包含未定义的标识符: {tok}")
+        pos = m.end()
+    for ref in ref_codes:
+        if ref not in expression:
+            raise HTTPException(400, f"计算表达式未引用指标 {ref}")
+
+
 @router.post("/composite-metrics", tags=["复合指标"])
 def create_composite(body: CompositeIn):
     s = get_session()
@@ -965,9 +1028,7 @@ def create_composite(body: CompositeIn):
         _check_code(s, CompositeMetric, body.code)
         _check_code_rule(s, "composite_metric", body.code)
         _check_refs(s, body.ref_codes)
-        for ref in body.ref_codes:
-            if ref not in body.expression:
-                raise HTTPException(400, f"计算表达式未引用指标 {ref}")
+        _check_expression(body.expression, body.ref_codes)
         m = CompositeMetric(**body.dict())
         s.add(m)
         s.commit()
@@ -982,11 +1043,12 @@ def list_composites(keyword: str = "", page: int = 1, page_size: int = 20):
     try:
         q = s.query(CompositeMetric)
         if keyword:
-            q = q.filter(or_(CompositeMetric.code.like(f"%{keyword}%"),
-                             CompositeMetric.name.like(f"%{keyword}%")))
+            q = q.filter(or_(CompositeMetric.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             CompositeMetric.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         total = q.count()
         rows = (q.order_by(CompositeMetric.id)
-                .offset((page - 1) * page_size).limit(page_size).all())
+                .offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         tags = _with_tags(s, "composite_metric", [m.id for m in rows])
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
@@ -1047,6 +1109,7 @@ def update_composite(metric_id: int, body: CompositeIn):
         _check_code(s, CompositeMetric, body.code, exclude_id=metric_id)
         _check_code_rule(s, "composite_metric", body.code)
         _check_refs(s, body.ref_codes)
+        _check_expression(body.expression, body.ref_codes)
         _snapshot_version(s, "composite_metric", m, "update", "编辑更新")
         for k, v in body.dict().items():
             setattr(m, k, v)
@@ -1215,8 +1278,8 @@ def list_logical_models(keyword: str = ""):
     try:
         q = s.query(LogicalModel)
         if keyword:
-            q = q.filter(or_(LogicalModel.code.like(f"%{keyword}%"),
-                             LogicalModel.name.like(f"%{keyword}%")))
+            q = q.filter(or_(LogicalModel.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             LogicalModel.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
         lms = q.order_by(LogicalModel.id).all()
         tags = _with_tags(s, "logical_model", [m.id for m in lms])
         items = [{
@@ -1311,7 +1374,7 @@ def create_downstream(body: DownstreamIn):
         try:
             sql, params = gen.generate_downstream_sql(m, lm)
             m.definition_sql = sql
-        except ValueError as e:
+        except (ValueError, MetricNotFoundError) as e:
             raise HTTPException(400, str(e))
         s.add(m)
         s.commit()
@@ -1328,10 +1391,11 @@ def list_downstream(page: int = 1, page_size: int = 20, keyword: str = ""):
         q = s.query(DownstreamModel).order_by(DownstreamModel.id.desc())
         if keyword:
             like = f"%{keyword}%"
-            q = q.filter(or_(DownstreamModel.code.like(like),
-                             DownstreamModel.name.like(like)))
+            q = q.filter(or_(DownstreamModel.code.like(_like_escape(like), escape="\\"),
+                             DownstreamModel.name.like(_like_escape(like), escape="\\")))
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = [{
             "id": m.id, "code": m.code, "name": m.name,
             "source_model_id": m.source_model_id,
@@ -1378,7 +1442,7 @@ def update_downstream(model_id: int, body: DownstreamIn):
         try:
             sql, _ = gen.generate_downstream_sql(m, lm)
             m.definition_sql = sql
-        except ValueError as e:
+        except (ValueError, MetricNotFoundError) as e:
             raise HTTPException(400, str(e))
         # 定义变更后旧物化表过期：落地表删除并复位状态
         if m.materialized and m.physical_table:
@@ -1434,6 +1498,10 @@ def materialize_downstream(model_id: int):
             with engine.begin() as conn:
                 conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
                 conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
+                # 物化表按日期桶建索引，支撑下游查询/质量检查按时间过滤
+                conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS ix_{_safe_ident(m.code)}_bucket "
+                    f"ON {tbl} (date_bucket)"))
             with engine.connect() as conn:
                 n = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
             m.materialized = 1
@@ -1442,7 +1510,7 @@ def materialize_downstream(model_id: int):
             inst.status = "SUCCESS"
             inst.detail = {"physical_table": tbl, "row_count": n}
             inst.finished_at = dt.datetime.now()
-            _run_quality_checks(s, m_id)  # 物化成功自动质量检查
+            _run_quality_checks(s, m_id)  # 物化成功自动质量检查（内部兜底，不抛错）
         except Exception as e:  # noqa: BLE001 - 失败写 FAILED 实例 + 告警
             s.rollback()
             inst = TaskInstance(task_type="materialize", entity_type="downstream_model",
@@ -1456,7 +1524,7 @@ def materialize_downstream(model_id: int):
             s.commit()
             if isinstance(e, ValueError):
                 raise HTTPException(400, str(e))
-            raise HTTPException(500, f"物化失败: {e}")
+            raise HTTPException(500, "物化失败，请查看服务端日志")
         s.commit()
         return ok({"physical_table": tbl, "row_count": n,
                    "task_instance_id": inst.id, "status": inst.status})
@@ -1552,7 +1620,7 @@ def reimport_downstream(model_id: int, start_date: Optional[str] = None,
             s.commit()
             if isinstance(e, ValueError):
                 raise HTTPException(400, str(e))
-            raise HTTPException(500, f"重导失败: {e}")
+            raise HTTPException(500, "重导失败，请查看服务端日志")
         s.commit()
         return ok({"physical_table": _safe_ident(m.physical_table),
                    "start_date": start.isoformat(),
@@ -1571,7 +1639,7 @@ def preview_downstream(model_id: int, limit: int = 100):
         m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
         try:
             sql, params = gen.generate_downstream_sql(m)
-        except ValueError as e:
+        except (ValueError, MetricNotFoundError) as e:
             raise HTTPException(400, str(e))
         result = s.execute(text(sql), params)
         cols = list(result.keys())
@@ -1590,12 +1658,13 @@ def downstream_data(model_id: int, page: int = 1, page_size: int = 100):
         if not m.materialized or not m.physical_table:
             raise HTTPException(400, "下游模型尚未物化，请先执行物化")
         tbl = _safe_ident(m.physical_table)
+        pg, pgs = _page_clamped(page), _page_size_clamped(page_size)
         total = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
         rows_sql = text(
             f"SELECT * FROM {tbl} ORDER BY date_bucket "
-            f"LIMIT {int(page_size)} OFFSET {(int(page) - 1) * int(page_size)}")
+            f"LIMIT {pgs} OFFSET {(pg - 1) * pgs}")
         result = s.execute(rows_sql)
-        return ok({"total": total, "page": page, "page_size": page_size,
+        return ok({"total": total, "page": pg, "page_size": pgs,
                    "columns": list(result.keys()),
                    "rows": [list(r) for r in result.fetchall()]})
     finally:
@@ -1657,10 +1726,11 @@ def list_downstream_apps(page: int = 1, page_size: int = 20, keyword: str = ""):
         q = s.query(DownstreamApp).order_by(DownstreamApp.id.desc())
         if keyword:
             like = f"%{keyword}%"
-            q = q.filter(or_(DownstreamApp.code.like(like),
-                             DownstreamApp.name.like(like)))
+            q = q.filter(or_(DownstreamApp.code.like(_like_escape(like), escape="\\"),
+                             DownstreamApp.name.like(_like_escape(like), escape="\\")))
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = []
         for a in rows:
             items.append({
@@ -1779,9 +1849,10 @@ def list_datasets(page: int = 1, page_size: int = 20, keyword: str = ""):
         q = s.query(Dataset).order_by(Dataset.id.desc())
         if keyword:
             like = f"%{keyword}%"
-            q = q.filter(or_(Dataset.code.like(like), Dataset.name.like(like)))
+            q = q.filter(or_(Dataset.code.like(_like_escape(like), escape="\\"), Dataset.name.like(_like_escape(like), escape="\\")))
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = []
         for d in rows:
             granted_apps = (s.query(DownstreamApp)
@@ -1931,7 +2002,8 @@ def openapi_logs(page: int = 1, page_size: int = 20,
         if app_id:
             q = q.filter_by(app_id=app_id)
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = []
         for log in rows:
             app = s.query(DownstreamApp).get(log.app_id)
@@ -2022,25 +2094,37 @@ def openapi_dataset_data(code: str, request: Request,
             if not dm.materialized or not dm.physical_table:
                 raise HTTPException(400, "数据集来源下游模型尚未物化，请先执行物化")
             tbl = _safe_ident(dm.physical_table)
+            pg, pgs = _page_clamped(page), _page_size_clamped(page_size)
             total = s.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
             result = s.execute(text(
                 f"SELECT * FROM {tbl} ORDER BY date_bucket "
-                f"LIMIT {int(page_size)} OFFSET {(int(page) - 1) * int(page_size)}"))
+                f"LIMIT {pgs} OFFSET {(pg - 1) * pgs}"))
             ret = {"columns": list(result.keys()),
                    "rows": [list(r) for r in result.fetchall()],
-                   "total": total, "page": page, "page_size": page_size}
+                   "total": total, "page": pg, "page_size": pgs}
         else:
             meta, columns, rows, sql = gen.execute_multi(
                 ds.metric_codes or [], ds.dim_codes or [],
                 start_date, end_date, ds.granularity)
-            start = (int(page) - 1) * int(page_size)
-            ret = {"columns": columns, "rows": rows[start:start + int(page_size)],
-                   "total": len(rows), "page": page, "page_size": page_size,
+            pg, pgs = _page_clamped(page), _page_size_clamped(page_size)
+            start = (pg - 1) * pgs
+            ret = {"columns": columns, "rows": rows[start:start + pgs],
+                   "total": len(rows), "page": pg, "page_size": pgs,
                    "sql": sql}
         _log_call(s, app.id, ds.id, len(ret["rows"]),
                   int((time.time() - t0) * 1000), "success")
         s.commit()
         return ok(ret)
+    except MetricNotFoundError as e:
+        s.rollback()
+        if app is not None and ds is not None:
+            try:
+                _log_call(s, app.id, ds.id, 0, int((time.time() - t0) * 1000),
+                          "error:400")
+                s.commit()
+            except Exception:
+                s.rollback()
+        raise HTTPException(400, str(e))
     except HTTPException as e:
         s.rollback()
         if app is not None and ds is not None:
@@ -2113,6 +2197,7 @@ def _lineage_upstream(s, code: str, nodes: list, edges: list, seen: set):
 def _lineage_downstream(s, code: str, nodes: list, edges: list):
     """向下影响（影响分析）：原子/派生 -> 下游派生/复合"""
     has_atomic = bool(s.query(AtomicMetric).filter_by(code=code).first())
+    composites = s.query(CompositeMetric).all()  # 提到循环外，避免 N+1 重复全表查询
     for dm in s.query(DerivedMetric).all():
         if has_atomic and code == dm.atomic.code:
             if not any(n["id"] == f"derived:{dm.code}" for n in nodes):
@@ -2122,7 +2207,7 @@ def _lineage_downstream(s, code: str, nodes: list, edges: list):
         elif code == dm.code and not any(n["id"] == f"derived:{dm.code}" for n in nodes):
             nodes.append({"id": f"derived:{dm.code}", "type": "derived",
                           "label": dm.name, "code": dm.code})
-        for cm in s.query(CompositeMetric).all():
+        for cm in composites:
             if dm.code in (cm.ref_codes or []) and \
                     any(n["id"] == f"derived:{dm.code}" for n in nodes):
                 if not any(n["id"] == f"composite:{cm.code}" for n in nodes):
@@ -2410,6 +2495,7 @@ def reimport_plan_execute(body: ReimportExecuteIn):
                                     trigger="auto", status="FAILED",
                                     error=str(e), finished_at=dt.datetime.now())
                 s.add(inst)
+                s.flush()  # 先落 id，供告警 source_id 引用
                 _new_alert(s, "error", "task", inst.id,
                            f"重导任务失败 {m_code}: {e}")
                 s.commit()
@@ -2455,7 +2541,8 @@ def list_metric_versions(entity_type: str, entity_id: int,
                                               entity_id=entity_id)
              .order_by(MetricVersion.id.desc()))
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = [{
             "id": v.id, "version_no": v.version_no,
             "change_type": v.change_type, "change_note": v.change_note,
@@ -2503,6 +2590,8 @@ def submit_approval(body: ApprovalIn):
             raise HTTPException(404, f"实体不存在: {body.entity_type} id={body.entity_id}")
         if getattr(obj, "status", "") == STATUS_PUBLISHED:
             raise HTTPException(400, f"{obj.name} 已是发布状态，无需重复提交")
+        if getattr(obj, "status", "") == "ARCHIVED":
+            raise HTTPException(400, f"{obj.name} 已归档停用，不能提交发布")
         pending = (s.query(Approval).filter_by(
             entity_type=body.entity_type, entity_id=body.entity_id,
             status="PENDING").first())
@@ -2532,7 +2621,8 @@ def list_approvals(status: Optional[str] = None,
         if status:
             q = q.filter_by(status=status)
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = [{
             "id": a.id, "entity_type": a.entity_type, "entity_id": a.entity_id,
             "entity_code": a.entity_code, "entity_name": a.entity_name,
@@ -2703,7 +2793,7 @@ def list_tags(keyword: str = ""):
         q = (s.query(EntityTag.tag, func.count(EntityTag.id).label("cnt"))
              .group_by(EntityTag.tag).order_by(func.count(EntityTag.id).desc()))
         if keyword:
-            q = q.filter(EntityTag.tag.like(f"%{keyword}%"))
+            q = q.filter(EntityTag.tag.like(f"%{_like_escape(keyword)}%", escape="\\"))
         return ok([{"tag": tag, "count": cnt} for tag, cnt in q.all()])
     finally:
         s.close()
@@ -2828,7 +2918,9 @@ def _check_quality_rule(s, rule: QualityRule):
         rule.last_result, rule.last_message = "error", f"校验执行异常: {e}"
         return rule.last_result, "", rule.last_message
     rule.last_result = result
-    rule.last_value = val
+    # row_count_change 的 last_value 存原始行数（波动 % 仅作展示值），
+    # 否则把百分比写回 last_value 会导致下次检查无法比较、每两次才校验一次
+    rule.last_value = str(n) if rule_type == "row_count_change" else val
     rule.last_message = msg
     rule.last_check_at = dt.datetime.now()
     return result, val, msg
@@ -2849,18 +2941,28 @@ def _check_with_instance(s, rule: QualityRule, trigger: str = "manual"):
     inst.error = "" if result == "ok" else msg
     inst.finished_at = dt.datetime.now()
     if result != "ok":
-        _new_alert(s, "error" if result == "error" else "warning",
-                   "quality", rule.id,
+        # 告警级别跟随规则配置的 severity（error 状态恒为 error）
+        level = "error" if result == "error" else (rule.severity or "warning")
+        _new_alert(s, level, "quality", rule.id,
                    f"质量规则告警 [{rule.rule_type}] "
                    f"{m.code if m else rule.entity_id}: {msg}")
     return result, val, msg
 
 
 def _run_quality_checks(s, entity_id: int):
-    """物化/重导/调度成功后自动校验该下游模型全部启用规则（trigger=auto）"""
-    for rule in s.query(QualityRule).filter_by(entity_id=entity_id,
-                                               enabled=1).all():
-        _check_with_instance(s, rule, trigger="auto")
+    """物化/重导/调度成功后自动校验该下游模型全部启用规则（trigger=auto）。
+    内部兜底不向上抛异常：单条规则校验失败由 _check_quality_rule 记 error，
+    整体异常写 error 告警，避免质量检查失败误伤物化/重导任务本身"""
+    try:
+        for rule in s.query(QualityRule).filter_by(entity_id=entity_id,
+                                                   enabled=1).all():
+            _check_with_instance(s, rule, trigger="auto")
+    except Exception as e:  # noqa: BLE001
+        try:
+            _new_alert(s, "error", "quality", entity_id,
+                       f"自动质量检查异常: {e}")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @router.post("/quality-rules", tags=["质量"])
@@ -2985,7 +3087,9 @@ def quality_health():
                     fresh_days = (dt.date.today() - ld).days if ld else None
                 except Exception:  # noqa: BLE001 - 物化表异常不阻断总览
                     pass
-            rules = s.query(QualityRule).filter_by(entity_id=m.id).all()
+            # 健康度只统计启用规则，禁用规则的旧失败结果不拖累等级
+            rules = s.query(QualityRule).filter_by(entity_id=m.id,
+                                                   enabled=1).all()
             failed = [r for r in rules if r.last_result == "fail"]
             error = [r for r in rules if r.last_result == "error"]
             if error or (fresh_days is not None and fresh_days > 7):
@@ -3025,7 +3129,8 @@ def list_alerts(unread_only: Optional[bool] = None,
         if unread_only:
             q = q.filter_by(read=0)
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = [{
             "id": a.id, "level": a.level, "source_type": a.source_type,
             "source_id": a.source_id, "message": a.message,
@@ -3090,6 +3195,20 @@ SCHEDULE_TYPES = ("daily", "interval")
 SCHEDULE_ACTIONS = ("materialize", "reimport")
 
 
+def _check_schedule_body(body: ScheduleIn):
+    """调度参数边界校验：小时/分钟/间隔分钟必须在合法范围"""
+    if body.schedule_type not in SCHEDULE_TYPES:
+        raise HTTPException(400, f"非法调度类型: {body.schedule_type}，可选 {SCHEDULE_TYPES}")
+    if body.action not in SCHEDULE_ACTIONS:
+        raise HTTPException(400, f"非法调度动作: {body.action}，可选 {SCHEDULE_ACTIONS}")
+    if not (0 <= body.hour <= 23):
+        raise HTTPException(400, f"非法小时: {body.hour}，必须 0-23")
+    if not (0 <= body.minute <= 59):
+        raise HTTPException(400, f"非法分钟: {body.minute}，必须 0-59")
+    if body.interval_minutes < 1:
+        raise HTTPException(400, f"非法间隔分钟: {body.interval_minutes}，必须 >= 1")
+
+
 def _calc_next_run(sch: Schedule) -> Optional[dt.datetime]:
     """下次运行时间：daily=下一到达时刻 / interval=当前+间隔分钟"""
     now = dt.datetime.now()
@@ -3106,8 +3225,23 @@ def _calc_next_run(sch: Schedule) -> Optional[dt.datetime]:
 
 def _execute_schedule_run(s, sch: Schedule, trigger: str = "schedule") -> str:
     """执行一次调度任务（物化/重导），写任务实例；失败回滚并写 FAILED 实例 + 告警。
-    返回 "SUCCESS"/"FAILED"；成功后由调用方触发自动质量检查"""
-    m = _get_or_404(s, DownstreamModel, sch.entity_id, "下游模型")
+    返回 "SUCCESS"/"FAILED"；失败同样推进 next_run_at，避免每 30s 无限重试刷告警；
+    成功后由调用方触发自动质量检查"""
+    sch_id = sch.id
+    m = s.query(DownstreamModel).get(sch.entity_id)
+    if not m:
+        # 模型已被删除：记录失败并推进下次执行时间，不再空转重试
+        s.rollback()
+        sch = s.query(Schedule).get(sch_id)
+        inst = TaskInstance(task_type=sch.action or "materialize",
+                            entity_type="downstream_model",
+                            entity_id=sch.entity_id, entity_code="",
+                            trigger=trigger, status="FAILED",
+                            error="下游模型不存在，调度已跳过",
+                            finished_at=dt.datetime.now())
+        s.add(inst)
+        sch.next_run_at = _calc_next_run(sch)
+        return "FAILED"
     m_id, m_code = m.id, m.code
     inst = TaskInstance(task_type=sch.action, entity_type="downstream_model",
                         entity_id=m_id, entity_code=m_code,
@@ -3153,6 +3287,9 @@ def _execute_schedule_run(s, sch: Schedule, trigger: str = "schedule") -> str:
         s.flush()  # 先落 id，供告警 source_id 引用
         _new_alert(s, "error", "task", inst.id,
                    f"调度任务失败 [{sch.action}] {m_code}: {e}")
+        # 失败也推进下次执行时间，避免每 30s 无限重试 + 告警刷屏
+        sch = s.query(Schedule).get(sch_id)
+        sch.next_run_at = _calc_next_run(sch)
         return "FAILED"
 
 
@@ -3187,10 +3324,7 @@ def create_schedule(body: ScheduleIn):
     s = get_session()
     try:
         m = _get_or_404(s, DownstreamModel, body.entity_id, "下游模型")
-        if body.schedule_type not in SCHEDULE_TYPES:
-            raise HTTPException(400, f"非法调度类型: {body.schedule_type}，可选 {SCHEDULE_TYPES}")
-        if body.action not in SCHEDULE_ACTIONS:
-            raise HTTPException(400, f"非法调度动作: {body.action}，可选 {SCHEDULE_ACTIONS}")
+        _check_schedule_body(body)
         sch = Schedule(entity_id=body.entity_id, schedule_type=body.schedule_type,
                        hour=body.hour, minute=body.minute,
                        interval_minutes=body.interval_minutes, action=body.action,
@@ -3235,10 +3369,7 @@ def update_schedule(schedule_id: int, body: ScheduleIn):
     try:
         sch = _get_or_404(s, Schedule, schedule_id, "调度")
         _get_or_404(s, DownstreamModel, body.entity_id, "下游模型")
-        if body.schedule_type not in SCHEDULE_TYPES:
-            raise HTTPException(400, f"非法调度类型: {body.schedule_type}")
-        if body.action not in SCHEDULE_ACTIONS:
-            raise HTTPException(400, f"非法调度动作: {body.action}")
+        _check_schedule_body(body)
         sch.entity_id = body.entity_id
         sch.schedule_type = body.schedule_type
         sch.hour = body.hour
@@ -3313,7 +3444,8 @@ def list_task_instances(task_type: Optional[str] = None,
         if status:
             q = q.filter_by(status=status)
         total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+        rows = (q.offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
         items = [{
             "id": i.id, "task_type": i.task_type, "entity_type": i.entity_type,
             "entity_id": i.entity_id, "entity_code": i.entity_code,
@@ -3360,7 +3492,12 @@ def retry_task_instance(instance_id: int):
         m = _get_or_404(s, DownstreamModel, inst.entity_id, "下游模型")
         m_id, m_code = m.id, m.code
         if inst.task_type == "quality_check":
-            rule = s.query(QualityRule).filter_by(entity_id=m_id).first()
+            # 重试原失败的那条规则（detail.rule_id）；兼容旧实例回退到第一条
+            d = inst.detail or {}
+            rule = (s.query(QualityRule).get(d.get("rule_id"))
+                    if d.get("rule_id") else None)
+            if not rule:
+                rule = s.query(QualityRule).filter_by(entity_id=m_id).first()
             if not rule:
                 raise HTTPException(400, "该实体没有质量规则，无需重试")
             result, val, msg = _check_with_instance(s, rule, trigger="manual")
@@ -3491,8 +3628,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="统一指标维度管理平台 Demo", version="1.0.0",
               lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
-                   allow_headers=["*"])
+# 仅放行本地前端来源，避免任意站点跨域读取平台数据
+app.add_middleware(CORSMiddleware,
+                   allow_origins=["http://127.0.0.1:8000",
+                                   "http://localhost:8000",
+                                   "http://127.0.0.1:5500",
+                                   "http://localhost:5500"],
+                   allow_methods=["GET", "POST", "PUT", "DELETE"],
+                   allow_headers=["Content-Type"])
 
 
 @app.exception_handler(HTTPException)
@@ -3505,9 +3648,11 @@ async def http_exc_handler(request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def unhandled_exc_handler(request, exc: Exception):
+    # 不向客户端暴露内部异常细节（路径/堆栈/表名等）
     return JSONResponse(
         status_code=500,
-        content={"code": 500, "message": f"服务器错误: {exc}", "data": None})
+        content={"code": 500, "message": "服务器内部错误，请查看服务端日志",
+                 "data": None})
 
 
 app.include_router(router, prefix="/api")
