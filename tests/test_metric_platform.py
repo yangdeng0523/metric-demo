@@ -974,3 +974,179 @@ def test_openapi_injection_guard(api):
     assert api.get("/openapi/v1/datasets/oa_ds_sec/data", headers=h).status_code == 200
     api.delete(f"/api/v1/datasets/{did}")
     api.delete(f"/api/v1/downstream-apps/{aid}")
+
+# ===================================================================
+# 任务重导：对象下游血缘（impact）+ 执行计划（plan）+ 确认执行（execute）
+# ===================================================================
+
+def _mk_order_derived(api, code):
+    """创建基于订单过程的派生指标（order_amount_sum + 7d + dim_city）"""
+    r = api.post("/api/v1/derived-metrics", json={
+        "code": code, "name": code, "atomic_code": "order_amount_sum",
+        "time_period": "7d", "dim_codes": ["dim_city"]})
+    assert r.status_code == 200, r.text
+    return r.json()["data"]["id"]
+
+
+def _impact(api, otype, oid):
+    r = api.get("/api/v1/reimport/impact",
+                params={"object_type": otype, "object_id": oid})
+    assert r.status_code == 200, r.text
+    return r.json()["data"]
+
+
+def test_reimport_impact_atomic_and_lm(api):
+    """原子指标/逻辑模型 -> 受影响下游模型及血缘链（对象 -> 逻辑模型 -> 下游）"""
+    atom = [m for m in api.get("/api/v1/atomic-metrics").json()["data"]["items"]
+            if m["code"] == "order_count"][0]
+    # 种子下游模型未物化：先物化，验证 impact 如实返回物化状态与行数
+    seed = [x for x in api.get("/api/v1/downstream-models",
+                               params={"page_size": 100}).json()["data"]["items"]
+            if x["code"] == "city_order_daily"][0]
+    api.post(f"/api/v1/downstream-models/{seed['id']}/materialize")
+    d = _impact(api, "atomic_metric", atom["id"])
+    assert d["object"]["code"] == "order_count"
+    ds = [x for x in d["downstreams"] if x["code"] == "city_order_daily"][0]
+    assert ds["materialized"] and ds["row_count"] > 0
+    assert [n["type"] for n in ds["chain"]] == \
+        ["atomic_metric", "logical_model", "downstream"]
+
+    lm = _trade_wide_lm(api)
+    d = _impact(api, "logical_model", lm["id"])
+    # 其他测试可能残留指向同一逻辑模型的下游模型，断言至少含种子模型
+    assert {"city_order_daily"} <= {x["code"] for x in d["downstreams"]}
+    ds0 = [x for x in d["downstreams"] if x["code"] == "city_order_daily"][0]
+    assert [n["type"] for n in ds0["chain"]] == ["logical_model", "downstream"]
+
+
+def test_reimport_impact_derived_and_dimension(api):
+    """派生指标/维度 -> 下游血缘；原子经派生间接命中（链含派生中介）"""
+    did = _mk_order_derived(api, "ri_amt_7d")
+    lm = _trade_wide_lm(api)
+    r = api.post("/api/v1/downstream-models", json={
+        "code": "ri_ds_der", "name": "派生下游", "source_model_id": lm["id"],
+        "granularity": "day",
+        "metrics": [{"metric_code": "ri_amt_7d", "dim_codes": ["dim_city"]}]})
+    mid = r.json()["data"]["id"]
+    try:
+        # 派生指标直接命中
+        d = _impact(api, "derived_metric", did)
+        assert {x["code"] for x in d["downstreams"]} == {"ri_ds_der"}
+        assert [n["type"] for n in d["downstreams"][0]["chain"]] == \
+            ["derived_metric", "logical_model", "downstream"]
+        # 其原子指标经派生间接命中（chain 含派生中介节点）
+        atom = [m for m in api.get("/api/v1/atomic-metrics").json()["data"]["items"]
+                if m["code"] == "order_amount_sum"][0]
+        ds = [x for x in _impact(api, "atomic_metric", atom["id"])["downstreams"]
+              if x["code"] == "ri_ds_der"][0]
+        assert [n["type"] for n in ds["chain"]] == \
+            ["atomic_metric", "derived_metric", "logical_model", "downstream"]
+        # 维度：直接命中（city_order_daily 的 dim_codes）+ 经派生命中（ri_ds_der）
+        dims = api.get("/api/v1/dimensions").json()["data"]
+        dim = [x for x in (dims if isinstance(dims, list) else dims["items"])
+               if x["code"] == "dim_city"][0]
+        codes = {x["code"] for x in _impact(api, "dimension", dim["id"])["downstreams"]}
+        assert {"city_order_daily", "ri_ds_der"} <= codes
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid}")
+        api.delete(f"/api/v1/derived-metrics/{did}")
+
+
+def test_reimport_impact_validation(api):
+    """对象类型非法 -> 400；对象不存在 -> 404"""
+    r = api.get("/api/v1/reimport/impact",
+                params={"object_type": "composite_metric", "object_id": 1})
+    assert r.status_code == 400 and "对象类型" in r.json()["message"]
+    assert api.get("/api/v1/reimport/impact",
+                   params={"object_type": "atomic_metric", "object_id": 99999}).status_code == 404
+
+
+def test_reimport_plan_estimated(api):
+    """执行计划：预估删除行数 = 物化表区间内行数；未物化不可预估；downstream_ids 过滤"""
+    mid_ok = _mk_ds_model(api, "ri_plan_ok")
+    n0 = api.post(f"/api/v1/downstream-models/{mid_ok}/materialize").json()["data"]["row_count"]
+    lm = _trade_wide_lm(api)
+    r = api.post("/api/v1/downstream-models", json={
+        "code": "ri_plan_nm", "name": "未物化", "source_model_id": lm["id"],
+        "granularity": "day",
+        "metrics": [{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]}]})
+    mid_nm = r.json()["data"]["id"]
+    atom = [m for m in api.get("/api/v1/atomic-metrics").json()["data"]["items"]
+            if m["code"] == "order_amount_sum"][0]
+    try:
+        d = api.post("/api/v1/reimport/plan", json={
+            "object_type": "atomic_metric", "object_id": atom["id"]}).json()["data"]
+        assert d["start_date"] < d["end_date"]        # 默认近 3 个月
+        items = {x["id"]: x for x in d["items"]}
+        assert items[mid_ok]["estimated_deleted"] == n0    # 区间覆盖全部种子数据
+        assert items[mid_ok]["materialized"] is True
+        assert items[mid_nm]["estimated_deleted"] is None  # 未物化不可预估
+        # downstream_ids 过滤：只计划选中模型
+        d2 = api.post("/api/v1/reimport/plan", json={
+            "object_type": "atomic_metric", "object_id": atom["id"],
+            "downstream_ids": [mid_ok]}).json()["data"]
+        assert [x["id"] for x in d2["items"]] == [mid_ok]
+        # 自定义区间：预估 = 区间内现有行数（5 天 x 6 城市）
+        today = dt.date.today()
+        start, end = today - dt.timedelta(days=10), today - dt.timedelta(days=6)
+        d3 = api.post("/api/v1/reimport/plan", json={
+            "object_type": "atomic_metric", "object_id": atom["id"],
+            "downstream_ids": [mid_ok],
+            "start_date": start.isoformat(), "end_date": end.isoformat()}).json()["data"]
+        assert d3["items"][0]["estimated_deleted"] == 5 * (n0 // 30)
+    finally:
+        api.delete(f"/api/v1/downstream-models/{mid_ok}")
+        api.delete(f"/api/v1/downstream-models/{mid_nm}")
+
+
+def test_reimport_plan_execute_batch(api):
+    """确认执行：批量重导 ok；未物化 skipped；单模型失败不阻断其余"""
+    m1 = _mk_ds_model(api, "ri_ex_1")
+    m2 = _mk_ds_model(api, "ri_ex_2")
+    n1 = api.post(f"/api/v1/downstream-models/{m1}/materialize").json()["data"]["row_count"]
+    n2 = api.post(f"/api/v1/downstream-models/{m2}/materialize").json()["data"]["row_count"]
+    lm = _trade_wide_lm(api)
+    r = api.post("/api/v1/downstream-models", json={
+        "code": "ri_ex_nm", "name": "未物化", "source_model_id": lm["id"],
+        "granularity": "day",
+        "metrics": [{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]}]})
+    m3 = r.json()["data"]["id"]
+    try:
+        # 全量默认区间：ok，删除/写入/总量一致
+        d = api.post("/api/v1/reimport/plan/execute", json={
+            "downstream_ids": [m1, m2]}).json()["data"]
+        by_id = {x["id"]: x for x in d["results"]}
+        assert by_id[m1]["status"] == "ok" and by_id[m1]["deleted"] == n1
+        assert by_id[m2]["status"] == "ok" and by_id[m2]["inserted"] == n2
+        assert by_id[m2]["total_rows"] == n2
+        # 自定义区间 + 未物化 skipped（不阻断 ok 模型）
+        today = dt.date.today()
+        start, end = today - dt.timedelta(days=3), today - dt.timedelta(days=1)
+        d2 = api.post("/api/v1/reimport/plan/execute", json={
+            "downstream_ids": [m1, m3],
+            "start_date": start.isoformat(), "end_date": end.isoformat()}).json()["data"]
+        by_id2 = {x["id"]: x for x in d2["results"]}
+        assert by_id2[m1]["status"] == "ok"
+        assert by_id2[m1]["deleted"] == 3 * (n1 // 30)
+        assert by_id2[m3]["status"] == "skipped" and "物化" in by_id2[m3]["message"]
+        # 单模型失败不阻断其余：DROP 物化表 -> DELETE 报错 -> error，另一个正常
+        from models import engine
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("DROP TABLE dl_ri_ex_2"))
+        d3 = api.post("/api/v1/reimport/plan/execute", json={
+            "downstream_ids": [m1, m2]}).json()["data"]
+        by_id3 = {x["id"]: x for x in d3["results"]}
+        assert by_id3[m1]["status"] == "ok"
+        assert by_id3[m2]["status"] == "error"
+        # 空列表 / 起止倒置 -> 400
+        assert api.post("/api/v1/reimport/plan/execute",
+                        json={"downstream_ids": []}).status_code == 400
+        assert api.post("/api/v1/reimport/plan/execute",
+                        json={"downstream_ids": [m1],
+                              "start_date": "2026-08-20",
+                              "end_date": "2026-08-01"}).status_code == 400
+    finally:
+        api.delete(f"/api/v1/downstream-models/{m1}")
+        api.delete(f"/api/v1/downstream-models/{m2}")
+        api.delete(f"/api/v1/downstream-models/{m3}")

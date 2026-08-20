@@ -282,7 +282,8 @@ function openModal({ title, fields = [], value = {}, width = 560, hint = "", onO
     const btn = $("modal-ok");
     btn.disabled = true; btn.textContent = "提交中…";
     try {
-      await onOk(out, value);
+      // onOk 返回 true：调用方自行接管（如修改后弹重导计划），不再自动关闭/提示
+      if (await onOk(out, value) === true) return;
       closeModal();
       toast("保存成功");
     } catch (e) {
@@ -367,6 +368,7 @@ const TITLES = {
   composites: ["复合指标", "基于派生指标的四则运算，如 客单价 = 支付金额 ÷ 支付笔数"],
   models: ["逻辑模型", "将物理表映射为逻辑模型，屏蔽底层表结构差异（P1）"],
   downstreams: ["下游模型", "基于逻辑模型 + 指标集合生成 DWS 汇总表，支持物化落地；上游更新上线后可按时间范围重导（默认近 3 个月）"],
+  reimport: ["任务重导", "选择模型/指标/维度 → 查看下游任务血缘 → 生成重导执行计划并手动执行；指标维度修改后自动提示受影响下游"],
   datasets: ["数据集", "可被下游应用调用的数据资产：物化表直读 / 指标实时计算，供报表看板消费"],
   openapi: ["开放 API", "下游应用通过 AppKey + AppSecret 认证直接查询数据集，调用可监控"],
   lineage: ["血缘追溯", "指标血缘（原子 → 派生 → 复合）+ 表血缘（物理表 → 逻辑模型 → 下游模型）"],
@@ -388,6 +390,7 @@ function switchTab(tab) {
   else if (tab === "composites") renderComposites();
   else if (tab === "models") renderModels();
   else if (tab === "downstreams") renderDownstreams();
+  else if (tab === "reimport") renderReimport();
   else if (tab === "datasets") renderDatasets();
   else if (tab === "openapi") renderOpenapi();
   else if (tab === "lineage") renderLineage();
@@ -658,8 +661,13 @@ async function atomicForm(id) {
     ],
     value: v,
     onOk: async (o) => {
-      if (id) await put(`/atomic-metrics/${id}`, o);
-      else await post("/atomic-metrics", o);
+      if (id) {
+        await put(`/atomic-metrics/${id}`, o);
+        await refreshAll();
+        // 口径已更新：存在受影响下游则自动弹出重导执行计划（返回 true 接管关闭）
+        return checkImpactAfterUpdate("atomic_metric", id);
+      }
+      await post("/atomic-metrics", o);
       await refreshAll();
     },
   });
@@ -699,8 +707,12 @@ async function dimForm(id) {
     ],
     value: v,
     onOk: async (o) => {
-      if (id) await put(`/dimensions/${id}`, o);
-      else await post("/dimensions", o);
+      if (id) {
+        await put(`/dimensions/${id}`, o);
+        await refreshAll();
+        return checkImpactAfterUpdate("dimension", id);
+      }
+      await post("/dimensions", o);
       await refreshAll();
     },
   });
@@ -796,8 +808,12 @@ async function derivedForm(id) {
     ],
     value: v,
     onOk: async (o) => {
-      if (id) await put(`/derived-metrics/${id}`, o);
-      else await post("/derived-metrics", o);
+      if (id) {
+        await put(`/derived-metrics/${id}`, o);
+        await refreshAll();
+        return checkImpactAfterUpdate("derived_metric", id);
+      }
+      await post("/derived-metrics", o);
       await refreshAll();
     },
   });
@@ -905,8 +921,12 @@ async function modelForm(id) {
     value: v,
     onOk: async (o) => {
       if (o.join_type === "SINGLE") o.join_config = [];
-      if (id) await put(`/logical-models/${id}`, o);
-      else await post("/logical-models", o);
+      if (id) {
+        await put(`/logical-models/${id}`, o);
+        await refreshAll();
+        return checkImpactAfterUpdate("logical_model", id);
+      }
+      await post("/logical-models", o);
       await refreshAll();
     },
   });
@@ -1031,6 +1051,176 @@ function reimportModal(info) {
       await refreshAll();
     },
   });
+}
+
+// ---------------------------------------------------------------- 任务重导
+// 选择模型/字段 → 下游任务血缘 → 生成重导执行计划 → 手动确认执行；
+// 指标/维度修改保存后也会自动弹出受影响下游的执行计划
+const REIMPORT_TYPE_LABEL = { atomic_metric: "原子指标", derived_metric: "派生指标", dimension: "维度", logical_model: "逻辑模型" };
+let REIMPORT_IMPACT = null;   // 最近一次 impact 结果（血缘图 + 计划表）
+let REIMPORT_PLAN = null;     // 最近一次 plan 预估（按下游 id 索引）
+
+function renderReimport() {
+  if (!$("reimport-start").value) $("reimport-start").value = reimportDefaultStart();
+  if (!$("reimport-end").value) $("reimport-end").value = _isoDate(new Date());
+  fillReimportObjects($("reimport-type").value, true);
+}
+
+function fillReimportObjects(type, keepSelection) {
+  const prev = $("reimport-object").value;
+  let list = [];
+  if (type === "atomic_metric") list = META.atomic.map(m => ({ value: m.id, label: `${m.name}（${m.code}）` }));
+  else if (type === "derived_metric") list = META.derived.map(m => ({ value: m.id, label: `${m.name}（${m.code}）` }));
+  else if (type === "dimension") list = DIMS.map(d => ({ value: d.id, label: `${d.name}（${d.code}）` }));
+  else list = LOGICAL_MODELS.map(m => ({ value: m.id, label: `${m.name}（${m.code}）` }));
+  $("reimport-object").innerHTML = list.map(o => `<option value="${o.value}">${esc(o.label)}</option>`).join("")
+    || '<option value="">暂无可选对象</option>';
+  if (keepSelection && [...$("reimport-object").options].some(o => o.value === prev)) {
+    $("reimport-object").value = prev;
+  }
+  loadReimportImpact();
+}
+
+// 反查受影响下游模型 → 渲染血缘图 + 计划表
+async function loadReimportImpact() {
+  const type = $("reimport-type").value, oid = $("reimport-object").value;
+  const el = $("reimport-graph");
+  if (!oid) { el.innerHTML = '<p class="empty">请选择对象</p>'; $("tbl-reimport-plan").innerHTML = ""; return; }
+  try {
+    const d = await api(`/reimport/impact?object_type=${type}&object_id=${oid}`);
+    REIMPORT_IMPACT = d; REIMPORT_PLAN = null;
+    $("reimport-impact-hint").textContent =
+      `对象：${REIMPORT_TYPE_LABEL[d.object.type]} ${d.object.name}（${d.object.code}）→ 受影响下游模型 ${d.downstreams.length} 个`;
+    if (!d.downstreams.length) {
+      el.innerHTML = '<p class="empty">该对象暂无下游模型引用</p>';
+      $("tbl-reimport-plan").innerHTML = '<tr><td class="empty">暂无受影响下游模型</td></tr>';
+      return;
+    }
+    // 血缘图：chain 结构 = 对象 →(派生中介)→ 逻辑模型 → 下游模型
+    const LEVEL = { atomic_metric: 0, dimension: 0, derived_metric: 1, logical_model: 2, downstream: 3 };
+    const STYLE = {
+      atomic_metric: ["#eff6ff", "#2563eb", "原子指标"],
+      derived_metric: ["#ecfdf5", "#059669", "派生指标"],
+      dimension: ["#faf5ff", "#7c3aed", "维度"],
+      logical_model: ["#eef2ff", "#6366f1", "逻辑模型"],
+      downstream: ["#fff1f5", "#db2777", "下游模型"],
+    };
+    const nodes = new Map(), edges = [];
+    d.downstreams.forEach(ds => (ds.chain || []).forEach((n, i) => {
+      const id = n.type + ":" + n.code;
+      if (!nodes.has(id)) nodes.set(id, { id, type: n.type, label: n.name, code: n.code });
+      if (i > 0) edges.push({ from: (ds.chain[i - 1].type) + ":" + ds.chain[i - 1].code, to: id });
+    }));
+    renderGraph(el, { nodes: [...nodes.values()], edges }, LEVEL, STYLE);
+    renderReimportPlanTable(d.downstreams, null);
+  } catch (e) {
+    el.innerHTML = `<p class="empty">${esc(e.message)}</p>`;
+  }
+}
+
+function renderReimportPlanTable(downstreams, planItems) {
+  const byId = planItems ? Object.fromEntries(planItems.map(x => [x.id, x])) : {};
+  $("tbl-reimport-plan").innerHTML = `<thead><tr>
+      <th style="width:36px"></th><th>编码</th><th>名称</th><th>来源逻辑模型</th><th>粒度</th>
+      <th>物化状态</th><th>物化表 / 行数</th><th>预估删除行数</th></tr></thead><tbody>` +
+    downstreams.map(x => `<tr>
+      <td><input type="checkbox" class="ri-check" data-id="${x.id}" ${x.materialized ? "checked" : ""}></td>
+      <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td><td>${esc(x.source_model_code || "-")}</td>
+      <td>${GRANULARITY_LABEL[x.granularity] || x.granularity}</td>
+      <td>${x.materialized ? '<span class="badge status pub">已物化</span>' : '<span class="badge status">未物化</span>'}</td>
+      <td>${x.materialized ? `<code>${esc(x.physical_table)}</code> <span class="hint-text">${fmt(x.row_count)} 行</span>` : '<span class="hint-text">-</span>'}</td>
+      <td class="ri-est" data-id="${x.id}">${byId[x.id] ? (byId[x.id].estimated_deleted == null ? '<span class="hint-text">未物化</span>' : fmt(byId[x.id].estimated_deleted) + " 行") : '<span class="hint-text">待生成</span>'}</td>
+    </tr>`).join("") +
+    `</tbody>`;
+}
+
+// 生成执行计划：按当前对象 + 时间范围 + 勾选模型预估删除行数
+async function genReimportPlan() {
+  const oid = $("reimport-object").value;
+  if (!oid) { toast("请先选择对象", false); return; }
+  const ids = [...document.querySelectorAll(".ri-check:checked")].map(c => Number(c.dataset.id));
+  if (!ids.length) { toast("请至少勾选一个下游模型", false); return; }
+  try {
+    const d = await post("/reimport/plan", {
+      object_type: $("reimport-type").value, object_id: Number(oid),
+      start_date: $("reimport-start").value || null,
+      end_date: $("reimport-end").value || null,
+      downstream_ids: ids,
+    });
+    REIMPORT_PLAN = d;
+    renderReimportPlanTable(REIMPORT_IMPACT.downstreams, d.items);
+    toast(`执行计划已生成：${d.items.length} 个模型，区间 ${d.start_date} ~ ${d.end_date}`);
+  } catch (e) { toast(e.message, false); }
+}
+
+// 执行选中重导（手动确认）
+async function execReimportPlan() {
+  const oid = $("reimport-object").value;
+  if (!oid) { toast("请先选择对象", false); return; }
+  const ids = [...document.querySelectorAll(".ri-check:checked")].map(c => Number(c.dataset.id));
+  if (!ids.length) { toast("请至少勾选一个下游模型", false); return; }
+  const s = $("reimport-start").value, e = $("reimport-end").value;
+  const range = s && e ? `（${s} ~ ${e}）` : "（默认近 3 个月）";
+  if (!window.confirm(`确认重导 ${ids.length} 个下游模型 ${range}？未物化模型将被跳过`)) return;
+  try {
+    const d = await post("/reimport/plan/execute", {
+      downstream_ids: ids, start_date: s || null, end_date: e || null });
+    const st = { ok: 0, skipped: 0, error: 0 };
+    (d.results || []).forEach(r => { st[r.status] = (st[r.status] || 0) + 1; });
+    const errMsgs = (d.results || []).filter(r => r.status === "error")
+      .map(r => `${r.code}: ${r.message}`).join("；");
+    toast(`重导完成：成功 ${st.ok} 个，跳过 ${st.skipped} 个${st.error ? `，失败 ${st.error} 个（${errMsgs}）` : ""}`, st.error === 0);
+    await refreshAll();
+  } catch (e) { toast(e.message, false); }
+}
+
+// 重导执行计划确认弹窗：受影响下游列表（勾选）+ 时间范围，确认后执行；
+// 供「指标/维度修改后自动弹出」与页内按钮共用；返回 true 表示已接管弹窗关闭
+function reimportPlanModal(object, downstreams) {
+  closeModal();
+  openModal({
+    title: `重导执行计划 · ${object.name}（${object.code}）`,
+    width: 660,
+    fields: [
+      { key: "downstream_ids", label: `受影响下游模型（${downstreams.length} 个）`, type: "multi", span: 2,
+        options: downstreams.map(x => ({
+          value: x.id,
+          label: `${x.code} · ${x.name}${x.materialized ? `（已物化 ${x.row_count ?? 0} 行）` : "（未物化，执行时将跳过）"}`,
+        })) },
+      { key: "start_date", label: "开始日期", type: "date", required: true },
+      { key: "end_date", label: "结束日期", type: "date", required: true },
+    ],
+    value: {
+      downstream_ids: downstreams.filter(x => x.materialized).map(x => x.id),
+      start_date: reimportDefaultStart(), end_date: _isoDate(new Date()),
+    },
+    hint: "该对象口径已更新，建议尽快重导受影响的下游物化表（删除区间内旧行并按最新定义重算）；默认近 3 个月",
+    onOk: async (o) => {
+      if (o.start_date > o.end_date) throw new Error("开始日期不能晚于结束日期");
+      if (!o.downstream_ids.length) throw new Error("请至少勾选一个下游模型");
+      const d = await post("/reimport/plan/execute", {
+        downstream_ids: o.downstream_ids,
+        start_date: o.start_date, end_date: o.end_date });
+      const st = { ok: 0, skipped: 0, error: 0 };
+      (d.results || []).forEach(r => { st[r.status] = (st[r.status] || 0) + 1; });
+      const errMsgs = (d.results || []).filter(r => r.status === "error")
+        .map(r => `${r.code}: ${r.message}`).join("；");
+      toast(`重导完成：成功 ${st.ok} 个，跳过 ${st.skipped} 个${st.error ? `，失败 ${st.error} 个（${errMsgs}）` : ""}`, st.error === 0);
+      closeModal();
+      await refreshAll();
+      return true;   // 已自行关闭并提示，跳过 openModal 默认行为
+    },
+  });
+  return true;
+}
+
+// 指标/维度修改保存后：反查受影响下游，有则弹执行计划确认框（新建无下游引用，不查）；
+// 返回 true 表示已接管 modal 关闭（弹窗已由 reimportPlanModal 打开）
+async function checkImpactAfterUpdate(type, id) {
+  try {
+    const d = await api(`/reimport/impact?object_type=${type}&object_id=${id}`);
+    if (d.downstreams.length) return reimportPlanModal(d.object, d.downstreams);
+  } catch { /* 影响分析失败不阻断保存流程 */ }
 }
 // ---------------------------------------------------------------- 数据集
 const DS_TYPE_LABEL = { downstream_model: "物化表", metric_query: "指标实时查询" };
@@ -1543,6 +1733,18 @@ function bindEvents() {
     else if (btn.dataset.act === "del") confirmDelete("删除该下游模型？（已物化将先 DROP 物化表）", () => del(`/downstream-models/${id}`));
     else downstreamOp(btn);
   });
+
+  // 任务重导：对象切换 → 刷新血缘与计划；生成计划 / 执行选中
+  $("reimport-type").onchange = () => fillReimportObjects($("reimport-type").value, false);
+  $("reimport-object").onchange = loadReimportImpact;
+  $("btn-reimport-plan").onclick = listenerWrap(genReimportPlan);
+  $("btn-reimport-execute").onclick = listenerWrap(execReimportPlan);
+  $("btn-reimport-all").onclick = () => {
+    const checks = [...document.querySelectorAll(".ri-check")];
+    const allOn = checks.every(c => c.checked);
+    checks.forEach(c => { c.checked = !allOn; });
+    $("btn-reimport-all").textContent = allOn ? "全选" : "全不选";
+  };
 
   // 数据集
   $("btn-new-dataset").onclick = listenerWrap(() => datasetForm());

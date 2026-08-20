@@ -1236,46 +1236,63 @@ def _reimport_default_start():
     return dt.date(y, m, 1)
 
 
+def _reimport_range(start_date: Optional[str] = None,
+                    end_date: Optional[str] = None):
+    """解析重导时间范围：默认近 3 个月（3 个月前当月 1 日 ~ 今天）；
+    校验日期格式与起止顺序，非法抛 400"""
+    try:
+        start = dt.date.fromisoformat(start_date) if start_date else _reimport_default_start()
+        end = dt.date.fromisoformat(end_date) if end_date else dt.date.today()
+    except ValueError:
+        raise HTTPException(400, "日期格式非法，需为 YYYY-MM-DD")
+    if start > end:
+        raise HTTPException(400, "开始日期不能晚于结束日期")
+    return start, end
+
+
+def _do_reimport(s, m, sb: str, eb: str):
+    """按最新上游定义重算物化表区间数据（DELETE + INSERT 同一事务，原子）。
+    重新生成定义 SQL = 读取上游逻辑模型/指标/维度最新口径；
+    返回 (deleted, inserted, total)；上游定义非法时抛 ValueError"""
+    sql, params = gen.generate_downstream_sql(m)
+    m.definition_sql = sql
+    tbl = _safe_ident(m.physical_table)
+    params["r_s"], params["r_e"] = sb, eb
+    with engine.begin() as conn:
+        deleted = conn.execute(text(
+            f"DELETE FROM {tbl} WHERE date_bucket >= :r_s AND date_bucket <= :r_e"),
+            {"r_s": sb, "r_e": eb}).rowcount
+        inserted = conn.execute(text(
+            f"INSERT INTO {tbl} SELECT * FROM ( {sql} ) t "
+            f"WHERE date_bucket >= :r_s AND date_bucket <= :r_e"), params).rowcount
+    with engine.connect() as conn:
+        total = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+    m.row_count = total
+    return deleted, inserted, total
+
+
 @router.post("/downstream-models/{model_id}/reimport", tags=["下游模型"])
 def reimport_downstream(model_id: int, start_date: Optional[str] = None,
                         end_date: Optional[str] = None):
     """重导：上游逻辑模型指标/维度更新上线后，按时间范围重建物化表数据。
     物化表区间内先 DELETE 再按最新定义重算 INSERT（同一事务，原子）；
-    默认范围 = 近 3 个月（上月 3 个月的当月 1 日 ~ 今天），可用参数覆盖。"""
+    默认范围 = 近 3 个月（3 个月前当月 1 日 ~ 今天），可用参数覆盖。"""
     s = get_session()
     try:
         m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
         if not m.materialized or not m.physical_table:
             raise HTTPException(400, "请先物化，再执行数据重导")
-        try:
-            start = dt.date.fromisoformat(start_date) if start_date else _reimport_default_start()
-            end = dt.date.fromisoformat(end_date) if end_date else dt.date.today()
-        except ValueError:
-            raise HTTPException(400, "日期格式非法，需为 YYYY-MM-DD")
-        if start > end:
-            raise HTTPException(400, "开始日期不能晚于结束日期")
+        start, end = _reimport_range(start_date, end_date)
         # 按模型粒度生成桶边界字符串（日/周/月），保证区间匹配 date_bucket
         fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
         sb, eb = start.strftime(fmt), end.strftime(fmt)
         try:
-            sql, params = gen.generate_downstream_sql(m)  # 重新生成 = 读取上游最新定义
+            deleted, inserted, total = _do_reimport(s, m, sb, eb)
         except ValueError as e:
             raise HTTPException(400, str(e))
-        m.definition_sql = sql
-        tbl = _safe_ident(m.physical_table)
-        params["r_s"], params["r_e"] = sb, eb
-        with engine.begin() as conn:
-            deleted = conn.execute(text(
-                f"DELETE FROM {tbl} WHERE date_bucket >= :r_s AND date_bucket <= :r_e"),
-                {"r_s": sb, "r_e": eb}).rowcount
-            inserted = conn.execute(text(
-                f"INSERT INTO {tbl} SELECT * FROM ( {sql} ) t "
-                f"WHERE date_bucket >= :r_s AND date_bucket <= :r_e"), params).rowcount
-        with engine.connect() as conn:
-            total = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
-        m.row_count = total
         s.commit()
-        return ok({"physical_table": tbl, "start_date": start.isoformat(),
+        return ok({"physical_table": _safe_ident(m.physical_table),
+                   "start_date": start.isoformat(),
                    "end_date": end.isoformat(), "deleted": deleted,
                    "inserted": inserted, "total_rows": total})
     finally:
@@ -1911,6 +1928,200 @@ def get_lineage(code: str):
                 seen_e.add(k)
                 uniq_edges.append(e)
         return ok({"nodes": uniq_nodes, "edges": uniq_edges})
+    finally:
+        s.close()
+
+
+# ===========================================================================
+# 5.11 任务重导：对象下游血缘 + 重导执行计划生成 + 确认执行
+# 下游模型只使用原子/派生指标（复合指标不进下游），故对象类型限定 4 类
+# ===========================================================================
+
+REIMPORT_OBJECT_TYPES = ("atomic_metric", "derived_metric", "dimension", "logical_model")
+
+
+def _resolve_reimport_object(s, object_type: str, object_id: int):
+    """定位重导对象，返回 {type, code, name}；对象类型非法/不存在时抛 4xx"""
+    if object_type not in REIMPORT_OBJECT_TYPES:
+        raise HTTPException(400, f"不支持的对象类型: {object_type}，"
+                                 f"可选: {', '.join(REIMPORT_OBJECT_TYPES)}")
+    if object_type == "atomic_metric":
+        obj = _get_or_404(s, AtomicMetric, object_id, "原子指标")
+    elif object_type == "derived_metric":
+        obj = _get_or_404(s, DerivedMetric, object_id, "派生指标")
+    elif object_type == "dimension":
+        obj = _get_or_404(s, Dimension, object_id, "维度")
+    else:
+        obj = _get_or_404(s, LogicalModel, object_id, "逻辑模型")
+    return {"type": object_type, "id": object_id, "code": obj.code, "name": obj.name}
+
+
+def _find_impacted_downstreams(s, object_type: str, object_id: int):
+    """反查受影响的下游模型（任务血缘）：对象 ->(派生中介)-> 逻辑模型 -> 下游模型。
+    返回 (object_node, [{"dm": DownstreamModel, "chain": [节点...]}, ...])；
+    chain 节点形如 {type, code, name}，type ∈ 对象类型/downstream"""
+    object_node = _resolve_reimport_object(s, object_type, object_id)
+
+    if object_type == "logical_model":
+        # 逻辑模型：source_model_id 外键直接反查其下游模型
+        hits = [{"dm": ds, "chain": [object_node]}
+                for ds in s.query(DownstreamModel)
+                .filter_by(source_model_id=object_id).all()]
+        for h in hits:
+            h["chain"].append({"type": "downstream",
+                               "code": h["dm"].code, "name": h["dm"].name})
+        return object_node, hits
+
+    # 命中编码：下游 metrics[].metric_code 匹配即受影响；
+    # 原子指标/维度还会经派生指标间接命中（派生被下游引用）
+    hit_codes = set()
+    if object_type == "atomic_metric":
+        hit_codes.add(object_node["code"])
+        for dm in s.query(DerivedMetric).filter_by(atomic_id=object_id).all():
+            hit_codes.add(dm.code)
+    elif object_type == "derived_metric":
+        hit_codes.add(object_node["code"])
+    elif object_type == "dimension":
+        for dm in s.query(DerivedMetric).all():
+            if object_node["code"] in (dm.dim_codes or []):
+                hit_codes.add(dm.code)
+
+    results = []
+    for ds in s.query(DownstreamModel).all():
+        used, mid_node = False, None
+        for it in (ds.metrics or []):
+            mc = it.get("metric_code")
+            if mc in hit_codes:
+                used = True
+                # 指标是派生且非对象本身 -> 血缘链补派生中介节点
+                if mc != object_node["code"] and \
+                        object_type in ("atomic_metric", "dimension"):
+                    dm = s.query(DerivedMetric).filter_by(code=mc).first()
+                    if dm:
+                        mid_node = {"type": "derived_metric",
+                                    "code": dm.code, "name": dm.name}
+                break
+            if object_type == "dimension" and \
+                    object_node["code"] in (it.get("dim_codes") or []):
+                used = True
+                break
+        if not used:
+            continue
+        chain = [object_node]
+        if mid_node:
+            chain.append(mid_node)
+        if object_type != "logical_model" and ds.source_model:
+            chain.append({"type": "logical_model", "code": ds.source_model.code,
+                          "name": ds.source_model.name})
+        chain.append({"type": "downstream", "code": ds.code, "name": ds.name})
+        results.append({"dm": ds, "chain": chain})
+    return object_node, results
+
+
+@router.get("/reimport/impact", tags=["任务重导"])
+def reimport_impact(object_type: str, object_id: int):
+    """对象下游任务血缘：给定模型/字段（原子/派生指标、维度、逻辑模型），
+    反查所有受影响的下游模型及血缘链，供任务重导页展示"""
+    s = get_session()
+    try:
+        object_node, hits = _find_impacted_downstreams(s, object_type, object_id)
+        return ok({
+            "object": object_node,
+            "downstreams": [{
+                "id": h["dm"].id, "code": h["dm"].code, "name": h["dm"].name,
+                "source_model_code": h["dm"].source_model.code
+                if h["dm"].source_model else None,
+                "granularity": h["dm"].granularity,
+                "materialized": bool(h["dm"].materialized),
+                "physical_table": h["dm"].physical_table,
+                "row_count": h["dm"].row_count,
+                "chain": h["chain"],
+            } for h in hits],
+        })
+    finally:
+        s.close()
+
+
+class ReimportPlanIn(BaseModel):
+    object_type: str
+    object_id: int
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    downstream_ids: Optional[list] = None
+
+
+@router.post("/reimport/plan", tags=["任务重导"])
+def reimport_plan(body: ReimportPlanIn):
+    """生成重导执行计划：列出受影响下游模型与预估影响行数
+    （默认近 3 个月；downstream_ids 可过滤只计划部分模型）"""
+    s = get_session()
+    try:
+        _, hits = _find_impacted_downstreams(s, body.object_type, body.object_id)
+        start, end = _reimport_range(body.start_date, body.end_date)
+        items = []
+        for h in hits:
+            m = h["dm"]
+            if body.downstream_ids and m.id not in body.downstream_ids:
+                continue
+            # 预估删除行数：物化表区间内现有行数（未物化无法预估）
+            est = None
+            if m.materialized and m.physical_table:
+                fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
+                sb, eb = start.strftime(fmt), end.strftime(fmt)
+                with engine.connect() as conn:
+                    est = conn.execute(text(
+                        f"SELECT COUNT(*) FROM {_safe_ident(m.physical_table)} "
+                        f"WHERE date_bucket >= :r_s AND date_bucket <= :r_e"),
+                        {"r_s": sb, "r_e": eb}).scalar()
+            items.append({
+                "id": m.id, "code": m.code, "name": m.name,
+                "granularity": m.granularity,
+                "materialized": bool(m.materialized),
+                "row_count": m.row_count, "estimated_deleted": est,
+            })
+        return ok({"start_date": start.isoformat(), "end_date": end.isoformat(),
+                   "items": items})
+    finally:
+        s.close()
+
+
+class ReimportExecuteIn(BaseModel):
+    downstream_ids: list
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+
+@router.post("/reimport/plan/execute", tags=["任务重导"])
+def reimport_plan_execute(body: ReimportExecuteIn):
+    """确认执行重导计划：逐个下游模型独立事务重导（一个失败不阻断其余）"""
+    if not body.downstream_ids:
+        raise HTTPException(400, "请至少选择一个下游模型")
+    s = get_session()
+    try:
+        start, end = _reimport_range(body.start_date, body.end_date)
+        results = []
+        for mid in body.downstream_ids:
+            m = _get_or_404(s, DownstreamModel, mid, "下游模型")
+            if not m.materialized or not m.physical_table:
+                results.append({"id": mid, "code": m.code, "status": "skipped",
+                                "deleted": None, "inserted": None,
+                                "total_rows": None, "message": "请先物化，再执行数据重导"})
+                continue
+            fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
+            sb, eb = start.strftime(fmt), end.strftime(fmt)
+            try:
+                deleted, inserted, total = _do_reimport(s, m, sb, eb)
+                s.commit()  # 每模型独立提交，失败不阻断其余
+                results.append({"id": mid, "code": m.code, "status": "ok",
+                                "deleted": deleted, "inserted": inserted,
+                                "total_rows": total, "message": None})
+            except Exception as e:  # noqa: BLE001 - 单模型失败不阻断批量执行
+                s.rollback()
+                results.append({"id": mid, "code": m.code, "status": "error",
+                                "deleted": None, "inserted": None,
+                                "total_rows": None, "message": str(e)})
+        return ok({"start_date": start.isoformat(), "end_date": end.isoformat(),
+                   "results": results})
     finally:
         s.close()
 

@@ -38,6 +38,8 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/></svg>逻辑模型</a>
       <a class="nav-item" data-tab="downstreams" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10m0 0l-4-4m4 4l4-4"/><path d="M5 21h14v-6H5z"/></svg>下游模型</a>
+      <a class="nav-item" data-tab="reimport" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>任务重导</a>
       <a class="nav-item" data-tab="datasets" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>数据集</a>
       <a class="nav-item" data-tab="openapi" href="#">
@@ -223,6 +225,45 @@
             </div>
           </div>
           <div class="table-wrap"><table id="tbl-downstreams"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 任务重导 ================== -->
+      <section class="tab-panel" id="tab-reimport">
+        <div class="card">
+          <div class="card-head">
+            <h2>选择重导对象 <span class="hint-text">模型 / 指标 / 维度更新后，反查下游任务血缘并手动重导（默认近 3 个月）</span></h2>
+          </div>
+          <div class="builder-row" id="reimport-object-bar">
+            <div class="field" style="min-width:180px;max-width:220px"><label>对象类型</label>
+              <select id="reimport-type">
+                <option value="atomic_metric">原子指标</option>
+                <option value="derived_metric">派生指标</option>
+                <option value="dimension">维度</option>
+                <option value="logical_model">逻辑模型</option>
+              </select></div>
+            <div class="field" style="min-width:260px"><label>选择对象</label><select id="reimport-object"></select></div>
+            <div class="field" style="min-width:130px;max-width:160px"><label>开始日期</label><input type="date" id="reimport-start"></div>
+            <div class="field" style="min-width:130px;max-width:160px"><label>结束日期</label><input type="date" id="reimport-end"></div>
+            <button class="btn-primary" id="btn-reimport-plan" style="height:40px">生成执行计划</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>下游任务血缘</h2>
+            <span class="hint-text" id="reimport-impact-hint"></span>
+          </div>
+          <div class="lineage-wrap"><div id="reimport-graph" class="lineage-graph"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>重导执行计划 <span class="hint-text">勾选要重导的下游模型，确认后执行（未物化模型需先物化）</span></h2>
+            <div class="card-actions">
+              <button class="btn-ghost btn-sm" id="btn-reimport-all">全选 / 全不选</button>
+              <button class="btn-primary btn-sm" id="btn-reimport-execute">执行选中重导</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-reimport-plan"></table></div>
         </div>
       </section>
 

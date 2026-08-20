@@ -459,8 +459,10 @@ class SQLGenerator:
                         where_clauses.append(f"lm.{fld} {op} :{key}")
                         params[key] = f["value"]
 
-            agg = metric.agg_function
-            field = _safe_ident(metric.physical_field)
+            # 聚合口径：派生指标取其底层原子指标（派生本身无 agg_function）
+            base = metric.atomic if mtype == "derived" else metric
+            agg = base.agg_function
+            field = _safe_ident(base.physical_field)
             select_cols.append(f"{_agg_expr(agg, f'lm.{field}')} AS metric_value")
             where_part = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             sub_sql = ("SELECT " + ", ".join(select_cols)
