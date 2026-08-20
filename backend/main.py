@@ -2473,7 +2473,7 @@ def reimport_plan_execute(body: ReimportExecuteIn):
             sb, eb = start.strftime(fmt), end.strftime(fmt)
             inst = TaskInstance(task_type="reimport", entity_type="downstream_model",
                                 entity_id=m_id, entity_code=m_code,
-                                trigger="auto", status="RUNNING")
+                                trigger="manual", status="RUNNING")
             s.add(inst)
             try:
                 deleted, inserted, total = _do_reimport(s, m, sb, eb)
@@ -2492,7 +2492,7 @@ def reimport_plan_execute(body: ReimportExecuteIn):
                 s.rollback()
                 inst = TaskInstance(task_type="reimport", entity_type="downstream_model",
                                     entity_id=m_id, entity_code=m_code,
-                                    trigger="auto", status="FAILED",
+                                    trigger="manual", status="FAILED",
                                     error=str(e), finished_at=dt.datetime.now())
                 s.add(inst)
                 s.flush()  # 先落 id，供告警 source_id 引用

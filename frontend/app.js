@@ -586,8 +586,22 @@ function toTextTable(cols, rows) {
 }
 
 // ---------------------------------------------------------------- 通用删除/确认
+// 页面内确认弹窗（替代 window.confirm）：可自动化、不阻塞主线程；确定 true / 取消 false
+function confirmModal(title, message, okText = "确 认") {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = v => { if (done) return; done = true; closeModal(); resolve(v); };
+    openModal({ title, hint: message, width: 480, onOk: async () => { finish(true); return true; } });
+    $("modal-ok").textContent = okText;
+    $("modal-cancel").onclick = () => finish(false);
+    $("modal-close").onclick = () => finish(false);
+    $("modal-backdrop").onclick = e => { if (e.target === $("modal-backdrop")) finish(false); };
+    document.addEventListener("keydown", e => { if (e.key === "Escape") finish(false); }, { once: true });
+  });
+}
+
 async function confirmDelete(message, fn) {
-  if (!window.confirm(message)) return;
+  if (!(await confirmModal("确认删除", message, "删 除"))) return;
   try {
     await fn();
     toast("删除成功");
@@ -1140,6 +1154,7 @@ function reimportModal(info) {
       const d = await post(`/downstream-models/${info.id}/reimport?start_date=${o.start_date}&end_date=${o.end_date}`);
       toast(`重导完成：删除 ${d.deleted} 行，重算写入 ${d.inserted} 行（共 ${d.total_rows} 行）`);
       await refreshAll();
+      renderReimportHistory();
     },
   });
 }
@@ -1155,6 +1170,37 @@ function renderReimport() {
   if (!$("reimport-start").value) $("reimport-start").value = reimportDefaultStart();
   if (!$("reimport-end").value) $("reimport-end").value = _isoDate(new Date());
   fillReimportObjects($("reimport-type").value, true);
+  renderReimportHistory();
+}
+
+// 重导历史记录：单模型重导 / 计划重导均写 TaskInstance(task_type=reimport)，此处按时间倒序展示
+function renderReimportHistory() {
+  api("/task-instances?task_type=reimport&page=1&page_size=50").then(d => {
+    $("tbl-reimport-history").innerHTML = `<thead><tr>
+        <th style="width:56px">ID</th><th>对象</th><th>触发</th><th>状态</th>
+        <th>开始</th><th>结束</th><th>数据范围</th><th>删除</th><th>插入</th>
+        <th style="width:110px">操作</th></tr></thead><tbody>${
+      (d.items || []).map(i => {
+        const det = i.detail || {};
+        const range = det.start_date && det.end_date ? `${det.start_date.slice(0, 10)} ~ ${det.end_date.slice(0, 10)}` : "-";
+        return `<tr>
+          <td class="num">${i.id}</td>
+          <td><code>${esc(i.entity_code || "-")}</code></td>
+          <td>${TRIGGER_LABEL[i.trigger] || i.trigger}</td>
+          <td>${taskStatusBadge(i.status)}</td>
+          <td class="hint-text">${esc(i.started_at || "-")}</td>
+          <td class="hint-text">${esc(i.finished_at || "-")}</td>
+          <td class="hint-text">${esc(range)}</td>
+          <td class="num">${det.deleted == null ? '<span class="hint-text">-</span>' : fmt(det.deleted)}</td>
+          <td class="num">${det.inserted == null ? '<span class="hint-text">-</span>' : fmt(det.inserted)}</td>
+          <td>
+            <button class="btn-ghost btn-sm" data-act="detail" data-id="${i.id}">详情</button>
+            ${i.status === "FAILED" ? `<button class="btn-ghost btn-sm" data-act="retry" data-id="${i.id}">重试</button>` : ""}
+          </td></tr>`;
+      }).join("") || `<tr><td colspan="10" class="empty">暂无重导历史（执行单模型重导或计划重导后自动记录）</td></tr>`}</tbody>`;
+    $("tbl-reimport-history").querySelectorAll("[data-act='detail']").forEach(b => b.onclick = () => taskInstanceDetail(Number(b.dataset.id)).catch(e => toast(e.message, false)));
+    $("tbl-reimport-history").querySelectorAll("[data-act='retry']").forEach(b => b.onclick = () => retryTask(Number(b.dataset.id)));
+  });
 }
 
 function fillReimportObjects(type, keepSelection) {
@@ -1252,7 +1298,8 @@ async function execReimportPlan() {
   if (!ids.length) { toast("请至少勾选一个下游模型", false); return; }
   const s = $("reimport-start").value, e = $("reimport-end").value;
   const range = s && e ? `（${s} ~ ${e}）` : "（默认近 3 个月）";
-  if (!window.confirm(`确认重导 ${ids.length} 个下游模型 ${range}？未物化模型将被跳过`)) return;
+  if (!(await confirmModal("确认执行重导",
+      `确认重导 ${ids.length} 个下游模型 ${range}？未物化模型将被跳过`))) return;
   try {
     const d = await post("/reimport/plan/execute", {
       downstream_ids: ids, start_date: s || null, end_date: e || null });
@@ -1262,6 +1309,7 @@ async function execReimportPlan() {
       .map(r => `${r.code}: ${r.message}`).join("；");
     toast(`重导完成：成功 ${st.ok} 个，跳过 ${st.skipped} 个${st.error ? `，失败 ${st.error} 个（${errMsgs}）` : ""}`, st.error === 0);
     await refreshAll();
+    renderReimportHistory();
   } catch (e) { toast(e.message, false); }
 }
 
@@ -1299,6 +1347,7 @@ function reimportPlanModal(object, downstreams) {
       toast(`重导完成：成功 ${st.ok} 个，跳过 ${st.skipped} 个${st.error ? `，失败 ${st.error} 个（${errMsgs}）` : ""}`, st.error === 0);
       closeModal();
       await refreshAll();
+      renderReimportHistory();
       return true;   // 已自行关闭并提示，跳过 openModal 默认行为
     },
   });
@@ -1353,7 +1402,8 @@ ${esc(ver.change_note || "无说明")}</pre></div>
     $("modal-body").querySelectorAll("[data-v-rollback]").forEach(b => b.onclick = async () => {
       const ver = (d.items || []).find(v => v.id === Number(b.dataset.vRollback));
       if (!ver) return;
-      if (!window.confirm(`回滚到 ${ver.version_no}（${esc(ver.created_at)}）？实体将恢复为该版本快照`)) return;
+      if (!(await confirmModal("版本回滚",
+          `回滚到 ${ver.version_no}（${ver.created_at}）？实体将恢复为该版本快照`, "回 滚"))) return;
       try {
         await post(`/metric-versions/${ver.id}/rollback`);
         toast("回滚成功");
@@ -1788,12 +1838,13 @@ async function taskInstanceDetail(id) {
 
 // 失败任务重试（按实例类型与参数重放；质量检查返回 {status:"ok", result...}）
 async function retryTask(id) {
-  if (!window.confirm("重试该任务？将按实例类型与参数重新执行")) return;
+  if (!(await confirmModal("重试任务", "重试该任务？将按实例类型与参数重新执行", "重 试"))) return;
   try {
     const d = await post(`/task-instances/${id}/retry`);
     const okFlag = d.status !== "FAILED";
     toast(d.status === "ok" ? `重试完成：${d.result}（${d.message || ""}）` : `重试执行：${TASK_STATUS_LABEL[d.status] || d.status}`, okFlag);
     renderTaskInstances();
+    renderReimportHistory();
     refreshAlertBadge();
   } catch (e) { toast(e.message, false); }
 }
@@ -2394,6 +2445,7 @@ function bindEvents() {
   $("reimport-object").onchange = loadReimportImpact;
   $("btn-reimport-plan").onclick = listenerWrap(genReimportPlan);
   $("btn-reimport-execute").onclick = listenerWrap(execReimportPlan);
+  $("btn-reimport-history-refresh").onclick = renderReimportHistory;
   $("btn-reimport-all").onclick = () => {
     const checks = [...document.querySelectorAll(".ri-check")];
     const allOn = checks.every(c => c.checked);
