@@ -1226,6 +1226,62 @@ def materialize_downstream(model_id: int):
         s.close()
 
 
+def _reimport_default_start():
+    """重导默认起点：3 个月前的当月 1 日（近 3 个月）"""
+    today = dt.date.today()
+    y, m = today.year, today.month - 3
+    if m <= 0:
+        m += 12
+        y -= 1
+    return dt.date(y, m, 1)
+
+
+@router.post("/downstream-models/{model_id}/reimport", tags=["下游模型"])
+def reimport_downstream(model_id: int, start_date: Optional[str] = None,
+                        end_date: Optional[str] = None):
+    """重导：上游逻辑模型指标/维度更新上线后，按时间范围重建物化表数据。
+    物化表区间内先 DELETE 再按最新定义重算 INSERT（同一事务，原子）；
+    默认范围 = 近 3 个月（上月 3 个月的当月 1 日 ~ 今天），可用参数覆盖。"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, DownstreamModel, model_id, "下游模型")
+        if not m.materialized or not m.physical_table:
+            raise HTTPException(400, "请先物化，再执行数据重导")
+        try:
+            start = dt.date.fromisoformat(start_date) if start_date else _reimport_default_start()
+            end = dt.date.fromisoformat(end_date) if end_date else dt.date.today()
+        except ValueError:
+            raise HTTPException(400, "日期格式非法，需为 YYYY-MM-DD")
+        if start > end:
+            raise HTTPException(400, "开始日期不能晚于结束日期")
+        # 按模型粒度生成桶边界字符串（日/周/月），保证区间匹配 date_bucket
+        fmt = GRANULARITY_FMT.get(m.granularity, "%Y-%m-%d")
+        sb, eb = start.strftime(fmt), end.strftime(fmt)
+        try:
+            sql, params = gen.generate_downstream_sql(m)  # 重新生成 = 读取上游最新定义
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        m.definition_sql = sql
+        tbl = _safe_ident(m.physical_table)
+        params["r_s"], params["r_e"] = sb, eb
+        with engine.begin() as conn:
+            deleted = conn.execute(text(
+                f"DELETE FROM {tbl} WHERE date_bucket >= :r_s AND date_bucket <= :r_e"),
+                {"r_s": sb, "r_e": eb}).rowcount
+            inserted = conn.execute(text(
+                f"INSERT INTO {tbl} SELECT * FROM ( {sql} ) t "
+                f"WHERE date_bucket >= :r_s AND date_bucket <= :r_e"), params).rowcount
+        total = engine.connect().execute(
+            text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+        m.row_count = total
+        s.commit()
+        return ok({"physical_table": tbl, "start_date": start.isoformat(),
+                   "end_date": end.isoformat(), "deleted": deleted,
+                   "inserted": inserted, "total_rows": total})
+    finally:
+        s.close()
+
+
 @router.post("/downstream-models/{model_id}/preview", tags=["下游模型"])
 def preview_downstream(model_id: int, limit: int = 100):
     """执行定义 SQL 预览（不落地），返回前 limit 行"""

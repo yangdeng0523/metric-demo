@@ -78,10 +78,10 @@ const del = path => api(path, { method: "DELETE" });
 
 // ---------------------------------------------------------------- 弹窗框架
 // fields: [{key, label, type, required, placeholder, options, span, hint}]
-// type: text/textarea/number/select/multi(checkbox 组)/dims/filters/joins/status/pre(code)
+// type: text/textarea/number/date/select/multi(checkbox 组)/dims/filters/joins/status/pre(code)
 let _modalResolve = null;
 
-function openModal({ title, fields = [], value = {}, width = 560, onOk }) {
+function openModal({ title, fields = [], value = {}, width = 560, hint = "", onOk }) {
   $("modal-title").textContent = title;
   $("modal").style.width = width + "px";
   $("modal-msg").textContent = "";
@@ -215,7 +215,7 @@ function openModal({ title, fields = [], value = {}, width = 560, onOk }) {
       }
       default: {
         const inp = document.createElement("input");
-        inp.type = f.type === "number" ? "number" : "text";
+        inp.type = f.type === "number" ? "number" : f.type === "date" ? "date" : "text";
         inp.id = "f-" + f.key;
         inp.placeholder = f.placeholder || "";
         inp.value = v;
@@ -231,6 +231,13 @@ function openModal({ title, fields = [], value = {}, width = 560, onOk }) {
     grid.appendChild(wrap);
   }
   body.appendChild(grid);
+  if (hint) {
+    const hi = document.createElement("div");
+    hi.className = "hint-text";
+    hi.style.marginTop = "10px";
+    hi.textContent = hint;
+    body.appendChild(hi);
+  }
 
   $("modal-backdrop").classList.add("open");
   $("modal-ok").onclick = async () => {
@@ -359,7 +366,7 @@ const TITLES = {
   derived: ["派生指标", "原子指标 + 修饰词（时间周期 / 统计粒度 / 筛选条件）派生为业务指标"],
   composites: ["复合指标", "基于派生指标的四则运算，如 客单价 = 支付金额 ÷ 支付笔数"],
   models: ["逻辑模型", "将物理表映射为逻辑模型，屏蔽底层表结构差异（P1）"],
-  downstreams: ["下游模型", "基于逻辑模型 + 指标集合生成 DWS 汇总表，支持物化落地（P2）"],
+  downstreams: ["下游模型", "基于逻辑模型 + 指标集合生成 DWS 汇总表，支持物化落地；上游更新上线后可按时间范围重导（默认近 3 个月）"],
   datasets: ["数据集", "可被下游应用调用的数据资产：物化表直读 / 指标实时计算，供报表看板消费"],
   openapi: ["开放 API", "下游应用通过 AppKey + AppSecret 认证直接查询数据集，调用可监控"],
   lineage: ["血缘追溯", "指标血缘（原子 → 派生 → 复合）+ 表血缘（物理表 → 逻辑模型 → 下游模型）"],
@@ -909,7 +916,7 @@ async function modelForm(id) {
 function renderDownstreams() {
   const kw = $("kw-downstreams").value.trim();
   api(`/downstream-models?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-downstreams").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>来源逻辑模型</th><th>粒度</th><th>汇总指标（维度）</th><th>物化状态</th><th>物化表 / 行数</th><th style="width:330px">操作</th></tr></thead>
+    $("tbl-downstreams").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>来源逻辑模型</th><th>粒度</th><th>汇总指标（维度）</th><th>物化状态</th><th>物化表 / 行数</th><th style="width:400px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td>
         <td>${esc(x.name)}</td>
@@ -921,6 +928,7 @@ function renderDownstreams() {
         <td>${x.materialized ? `<code>${esc(x.physical_table)}</code> <span class="hint-text">${x.row_count} 行</span>` : '<span class="hint-text">-</span>'}</td>
         <td>
           <button class="btn-ghost btn-sm" data-act="mat" data-id="${x.id}">${x.materialized ? "重新物化" : "物化"}</button>
+          <button class="btn-ghost btn-sm" data-act="reimport" data-id="${x.id}" title="上游逻辑模型/指标更新上线后，按时间范围重导数据（默认近 3 个月）">重导</button>
           <button class="btn-ghost btn-sm" data-act="preview" data-id="${x.id}">预览</button>
           <button class="btn-ghost btn-sm" data-act="data" data-id="${x.id}">数据</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
@@ -966,7 +974,7 @@ async function downstreamForm(id) {
   });
 }
 
-// 下游模型操作：物化 / 预览 / 物化表数据
+// 下游模型操作：物化 / 重导 / 预览 / 物化表数据
 async function downstreamOp(btn) {
   const id = Number(btn.dataset.id);
   try {
@@ -974,6 +982,10 @@ async function downstreamOp(btn) {
       const d = await post(`/downstream-models/${id}/materialize`);
       toast(`物化成功：${d.physical_table}（${d.row_count} 行）`);
       await refreshAll();
+    } else if (btn.dataset.act === "reimport") {
+      const info = await api(`/downstream-models/${id}`);
+      if (!info.materialized) { toast("尚未物化，请先执行物化", false); return; }
+      reimportModal(info);
     } else if (btn.dataset.act === "preview") {
       const d = await post(`/downstream-models/${id}/preview`);
       const info = await api(`/downstream-models/${id}`);
@@ -987,6 +999,38 @@ async function downstreamOp(btn) {
   } catch (e) {
     toast(e.message, false);
   }
+}
+
+const _pad2 = n => String(n).padStart(2, "0");
+const _isoDate = d => `${d.getFullYear()}-${_pad2(d.getMonth() + 1)}-${_pad2(d.getDate())}`;
+
+// 重导默认起点：3 个月前的当月 1 日（近 3 个月）
+function reimportDefaultStart() {
+  const d = new Date();
+  d.setMonth(d.getMonth() - 3);
+  d.setDate(1);
+  return _isoDate(d);
+}
+
+// 重导弹窗：选择时间范围（默认近 3 个月），区间内删除并按最新上游定义重算写入
+function reimportModal(info) {
+  const today = _isoDate(new Date());
+  openModal({
+    title: `重导数据 · ${info.code}（${info.physical_table}）`,
+    width: 520,
+    fields: [
+      { key: "start_date", label: "开始日期", type: "date", required: true },
+      { key: "end_date", label: "结束日期", type: "date", required: true },
+    ],
+    value: { start_date: reimportDefaultStart(), end_date: today },
+    hint: "上游逻辑模型指标/维度更新上线后，重导该时间范围数据（删除区间内旧行并按最新定义重新计算写入）；默认近 3 个月",
+    onOk: async (o) => {
+      if (o.start_date > o.end_date) throw new Error("开始日期不能晚于结束日期");
+      const d = await post(`/downstream-models/${info.id}/reimport?start_date=${o.start_date}&end_date=${o.end_date}`);
+      toast(`重导完成：删除 ${d.deleted} 行，重算写入 ${d.inserted} 行（共 ${d.total_rows} 行）`);
+      await refreshAll();
+    },
+  });
 }
 // ---------------------------------------------------------------- 数据集
 const DS_TYPE_LABEL = { downstream_model: "物化表", metric_query: "指标实时查询" };

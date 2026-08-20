@@ -771,6 +771,96 @@ def test_openapi_downstream_model_source(api):
     assert len(d2["rows"]) == 5 and d2["total"] == d["total"]
     api.delete(f"/api/v1/datasets/{did}")
     api.delete(f"/api/v1/downstream-apps/{aid}")
+
+
+# ===================================================================
+# 重导：上游逻辑模型指标/维度更新上线后，下游模型按时间范围重导数据
+# 默认范围 = 近 3 个月（3 个月前当月 1 日 ~ 今天），可传 start_date/end_date 覆盖
+# ===================================================================
+
+def _mk_ds_model(api, code):
+    """创建日粒度下游模型（dim_city + 订单金额/订单数）"""
+    lm = _trade_wide_lm(api)
+    r = api.post("/api/v1/downstream-models", json={
+        "code": code, "name": code, "source_model_id": lm["id"],
+        "granularity": "day",
+        "metrics": [{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]},
+                    {"metric_code": "order_count", "dim_codes": ["dim_city"]}]})
+    assert r.status_code == 200, r.text
+    return r.json()["data"]["id"]
+
+
+def test_reimport_requires_materialize(api):
+    """未物化不可重导 -> 400 提示先物化"""
+    mid = _mk_ds_model(api, "reimp_nom")
+    r = api.post(f"/api/v1/downstream-models/{mid}/reimport")
+    assert r.status_code == 400 and "物化" in r.json()["message"]
+    api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_reimport_default_range(api):
+    """默认重导近 3 个月：种子数据窗口（近 30 天）全部落在区间内 -> 全量重算，行数幂等"""
+    mid = _mk_ds_model(api, "reimp_def")
+    n0 = api.post(f"/api/v1/downstream-models/{mid}/materialize").json()["data"]["row_count"]
+    r = api.post(f"/api/v1/downstream-models/{mid}/reimport")
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    assert d["physical_table"] == "dl_reimp_def"
+    assert d["start_date"] < d["end_date"]           # 默认区间 = 近 3 个月
+    assert d["deleted"] == n0 and d["inserted"] == n0 and d["total_rows"] == n0
+    dd = api.get(f"/api/v1/downstream-models/{mid}/data",
+                 params={"page_size": 1000}).json()["data"]
+    assert dd["total"] == n0                         # 重导后物化表数据完整
+    api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_reimport_custom_range(api):
+    """自定义时间范围重导：仅重建区间内行（删除+重算），区间外数据保留；重复重导幂等"""
+    mid = _mk_ds_model(api, "reimp_rng")
+    n0 = api.post(f"/api/v1/downstream-models/{mid}/materialize").json()["data"]["row_count"]
+    d0 = api.get(f"/api/v1/downstream-models/{mid}/data",
+                 params={"page_size": 1000}).json()["data"]
+    num_days = len({r[0] for r in d0["rows"]})       # 种子覆盖的自然日数（30）
+    per_day = n0 // num_days                         # 日粒度 x 6 城市
+    today = dt.date.today()
+    start, end = today - dt.timedelta(days=10), today - dt.timedelta(days=6)
+    expect = ((end - start).days + 1) * per_day      # 5 天 x 6 城市 = 30
+    r = api.post(f"/api/v1/downstream-models/{mid}/reimport",
+                 params={"start_date": start.isoformat(), "end_date": end.isoformat()})
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    assert d["deleted"] == expect and d["inserted"] == expect
+    assert d["total_rows"] == n0                     # 区间外行保留
+    # 区间内日期桶全部重建、区间外日期桶仍在
+    dd = api.get(f"/api/v1/downstream-models/{mid}/data",
+                 params={"page_size": 1000}).json()["data"]
+    buckets = {r[0] for r in dd["rows"]}
+    assert start.isoformat() in buckets and end.isoformat() in buckets
+    assert {b for b in buckets if start.isoformat() <= b <= end.isoformat()} == \
+        {(start + dt.timedelta(days=i)).isoformat() for i in range(5)}
+    # 重复重导同一区间：幂等（删除/写入数一致，总量不变）
+    r2 = api.post(f"/api/v1/downstream-models/{mid}/reimport",
+                  params={"start_date": start.isoformat(), "end_date": end.isoformat()}).json()["data"]
+    assert r2["deleted"] == expect and r2["inserted"] == expect and r2["total_rows"] == n0
+    api.delete(f"/api/v1/downstream-models/{mid}")
+
+
+def test_reimport_validation_and_week(api):
+    """重导校验：起止倒置 / 日期格式非法 -> 400；周粒度模型默认范围重导正常"""
+    lm = _trade_wide_lm(api)
+    r = api.post("/api/v1/downstream-models", json={
+        "code": "reimp_val", "name": "重导校验", "source_model_id": lm["id"],
+        "granularity": "week",
+        "metrics": [{"metric_code": "order_amount_sum", "dim_codes": ["dim_city"]}]})
+    mid = r.json()["data"]["id"]
+    api.post(f"/api/v1/downstream-models/{mid}/materialize")
+    assert api.post(f"/api/v1/downstream-models/{mid}/reimport",
+                    params={"start_date": "2026-08-20", "end_date": "2026-08-01"}).status_code == 400
+    assert api.post(f"/api/v1/downstream-models/{mid}/reimport",
+                    params={"start_date": "2026/08/01"}).status_code == 400
+    # 默认近 3 个月 -> 覆盖全部种子周桶，删除=写入=总量
+    d = api.post(f"/api/v1/downstream-models/{mid}/reimport").json()["data"]
+    assert d["deleted"] == d["inserted"] > 0 and d["total_rows"] == d["deleted"]
     api.delete(f"/api/v1/downstream-models/{mid}")
 
 

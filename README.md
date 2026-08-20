@@ -103,6 +103,7 @@ METRIC_DB_PATH=/tmp/test.db .venv/bin/python -m pytest tests/ -q   # 45 passed
 | `GET /sql-preview` | 只生成 SQL 不执行（口径透明可审计；`metric_codes` 逗号分隔 + `granularity`） |
 | `GET /query/export` | 查询结果导出 Excel（.xlsx 下载，首列 date_bucket） |
 | `POST /downstream-models/{id}/materialize` | 物化：`CREATE TABLE dl_{code} AS <定义 SQL>`；重复执行 = 重建刷新（幂等） |
+| `POST /downstream-models/{id}/reimport?start_date=&end_date=` | **数据重导**：上游逻辑模型指标/维度更新上线后，按时间范围重建物化表数据（区间内 DELETE + 按最新定义重算 INSERT，同一事务原子）；默认范围 = 近 3 个月 |
 | `POST /downstream-models/{id}/preview` | 执行定义 SQL 预览前 N 行（不落地） |
 | `GET /downstream-models/{id}/data` | 查询物化表数据（分页，按 date_bucket 排序） |
 | `GET /lineage/{code}` | 指标血缘：物理表/字段 → 原子 → 派生 → 复合，支持影响分析与根因追溯 |
@@ -149,6 +150,7 @@ curl -s -H "X-App-Key: <appkey>" -H "X-App-Secret: <appsecret>" \
 1. **口径统一**：下游只能通过指标编码查询，SQL 由元数据生成，无旁路实现
 2. **动态 SQL**：即席查询由 SQLGenerator 按"原子→派生→复合"逐层解析拼装，多指标按 `date_bucket + 公共维度` LEFT JOIN 对齐，不落地
 3. **下游模型物化**：基于逻辑模型宽表生成 DWS 汇总表定义（`CREATE TABLE dl_{code} AS <定义 SQL>`），支持幂等重建刷新；指标过程表不在宽表范围内、复合指标未展开、custom 周期派生指标均拒绝
+3b. **数据重导**：上游逻辑模型指标/维度更新上线后，物化表按时间范围重导——区间内先 DELETE 再按最新上游定义重算 INSERT（同一事务，原子），默认近 3 个月（3 个月前当月 1 日 ~ 今天），可传 `start_date`/`end_date` 覆盖；区间外数据不受影响，重复重导幂等
 4. **复合指标安全计算**：`CAST(... AS REAL)` 防整数除、`NULLIF(分母, 0)` 零值保护
 5. **防注入**：所有表名/字段名/粒度格式走白名单校验（粒度经映射表取值，不直接进 SQL），值全部 `:param` 参数化绑定
 6. **全链路血缘**：每层定义记录引用关系（原子记物理字段、派生记原子 ID、复合记派生编码、下游模型记逻辑模型 + 物化表），查询时自动构建血缘图；表级血缘覆盖"物理表 → 逻辑模型 → 下游模型 → 物化表"
