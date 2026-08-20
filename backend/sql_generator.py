@@ -25,6 +25,14 @@ def _safe_ident(name: str) -> str:
     return name
 
 
+def _agg_expr(agg: str, expr: str) -> str:
+    """聚合函数 SQL 表达式：COUNT_DISTINCT 需翻译为 COUNT(DISTINCT x)
+    （SQLite 无原生 COUNT_DISTINCT 函数），其余聚合原样拼接"""
+    if agg == "COUNT_DISTINCT":
+        return f"COUNT(DISTINCT {expr})"
+    return f"{_safe_ident(agg)}({expr})"
+
+
 class MetricNotFoundError(Exception):
     pass
 
@@ -99,7 +107,7 @@ class SQLGenerator:
         bucket_fmt 传入 strftime 格式时，输出 date_bucket 分组列（日/周/月粒度）"""
         table = _safe_ident(metric.process.physical_table)
         date_field = _safe_ident(metric.process.date_field)
-        agg = _safe_ident(metric.agg_function)
+        agg = metric.agg_function
         field = _safe_ident(metric.physical_field)
 
         select_cols, join_clauses, group_cols, where_params = [], [], [], {}
@@ -146,7 +154,7 @@ class SQLGenerator:
         join_part = (" " + " ".join(join_clauses)) if join_clauses else ""
 
         sql = (
-            f"SELECT {agg}(t.{field}) AS metric_value{dims_part}\n"
+            f"SELECT {_agg_expr(agg, f't.{field}')} AS metric_value{dims_part}\n"
             f"FROM {table} t{join_part}\n"
             f"WHERE {' AND '.join(where_clauses)}{group_part}"
         )
@@ -451,9 +459,9 @@ class SQLGenerator:
                         where_clauses.append(f"lm.{fld} {op} :{key}")
                         params[key] = f["value"]
 
-            agg = _safe_ident(metric.agg_function)
+            agg = metric.agg_function
             field = _safe_ident(metric.physical_field)
-            select_cols.append(f"{agg}(lm.{field}) AS metric_value")
+            select_cols.append(f"{_agg_expr(agg, f'lm.{field}')} AS metric_value")
             where_part = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             sub_sql = ("SELECT " + ", ".join(select_cols)
                        + f"\nFROM (\n{lm_sql}\n) lm"

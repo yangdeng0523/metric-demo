@@ -1215,8 +1215,8 @@ def materialize_downstream(model_id: int):
         with engine.begin() as conn:
             conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
             conn.execute(text(f"CREATE TABLE {tbl} AS {sql}"), params)
-        n = engine.connect().execute(
-            text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+        with engine.connect() as conn:
+            n = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
         m.materialized = 1
         m.physical_table = tbl
         m.row_count = n
@@ -1271,8 +1271,8 @@ def reimport_downstream(model_id: int, start_date: Optional[str] = None,
             inserted = conn.execute(text(
                 f"INSERT INTO {tbl} SELECT * FROM ( {sql} ) t "
                 f"WHERE date_bucket >= :r_s AND date_bucket <= :r_e"), params).rowcount
-        total = engine.connect().execute(
-            text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+        with engine.connect() as conn:
+            total = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
         m.row_count = total
         s.commit()
         return ok({"physical_table": tbl, "start_date": start.isoformat(),

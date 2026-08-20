@@ -33,3 +33,14 @@ def _init_db():
 @pytest.fixture()
 def api():
     return client
+
+
+@pytest.fixture(autouse=True)
+def _pool_watch(request):
+    """诊断：每用例结束后检查连接池是否有未归还连接（泄漏定位用）"""
+    from models import engine
+    yield
+    pool = engine.pool
+    if pool.checkedout() > 0:
+        print(f"\n[POOL] {request.node.name} 后 checkedout={pool.checkedout()} "
+              f"size={pool.size()} overflow={pool.overflow()}")

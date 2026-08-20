@@ -864,6 +864,39 @@ def test_reimport_validation_and_week(api):
     api.delete(f"/api/v1/downstream-models/{mid}")
 
 
+def test_count_distinct_agg(api):
+    """COUNT_DISTINCT 聚合：翻译为 COUNT(DISTINCT x)（SQLite 无原生 COUNT_DISTINCT 函数）
+    —— 统一查询与下游模型物化/重导均可用"""
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "cd_order_cnt", "name": "去重订单数", "process_id": 1,
+        "agg_function": "COUNT_DISTINCT", "physical_field": "order_id"})
+    assert r.status_code == 200, r.text
+    amid = r.json()["data"]["id"]
+    try:
+        # 统一查询路径：SQL 中应为 COUNT(DISTINCT ...) 而非 COUNT_DISTINCT(...)
+        q = api.post("/api/v1/query", json={
+            "metric_codes": ["cd_order_cnt"], "dim_codes": ["dim_city"],
+            "granularity": "day"}).json()["data"]
+        assert q["summary"]["row_count"] > 0
+        assert "COUNT(DISTINCT" in q["sql"] and "COUNT_DISTINCT(" not in q["sql"]
+        # 下游模型：物化 + 默认范围重导（此前 COUNT_DISTINCT 原样拼接导致 SQLite 报错）
+        lm = _trade_wide_lm(api)
+        r = api.post("/api/v1/downstream-models", json={
+            "code": "cd_ds_model", "name": "去重计数", "source_model_id": lm["id"],
+            "granularity": "day",
+            "metrics": [{"metric_code": "cd_order_cnt", "dim_codes": ["dim_city"]},
+                        {"metric_code": "order_count", "dim_codes": ["dim_city"]}]})
+        mid = r.json()["data"]["id"]
+        assert "COUNT(DISTINCT" in api.get(f"/api/v1/downstream-models/{mid}").json()["data"]["definition_sql"]
+        n0 = api.post(f"/api/v1/downstream-models/{mid}/materialize").json()["data"]["row_count"]
+        assert n0 > 0
+        d = api.post(f"/api/v1/downstream-models/{mid}/reimport").json()["data"]
+        assert d["deleted"] == n0 and d["inserted"] == n0 and d["total_rows"] == n0
+        api.delete(f"/api/v1/downstream-models/{mid}")
+    finally:
+        api.delete(f"/api/v1/atomic-metrics/{amid}")
+
+
 def test_openapi_call_logging_stats(api):
     """调用日志：每次成功调用记录日志，stats 计数/行数累加"""
     aid, key, secret = _mk_app(api, "oa_app_log")
