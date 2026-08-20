@@ -11,7 +11,7 @@ import secrets
 
 from models import (
     init_db, get_session, STATUS_PUBLISHED,
-    SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
+    SubjectDomain, BusinessProcess, BusinessProcessField, Dimension, DimensionAttribute,
     AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
     DownstreamApp, Dataset, AppDatasetGrant,
     DimCity, DimCategory, DimUser,
@@ -56,6 +56,33 @@ def seed_metadata(s):
     ]
     s.add_all(processes)
     s.flush()
+
+    # 业务过程字段（物理事实表可度量/筛选/下钻的字段清单，与各过程表列一致）
+    process_fields = [
+        (processes[0].id, "order_id", "订单ID", "STRING"),
+        (processes[0].id, "order_date", "下单日期", "DATE"),
+        (processes[0].id, "city_id", "城市ID", "INT"),
+        (processes[0].id, "category_id", "类目ID", "INT"),
+        (processes[0].id, "user_id", "用户ID", "INT"),
+        (processes[0].id, "order_amount", "订单金额", "DECIMAL"),
+        (processes[0].id, "order_status", "订单状态", "STRING"),
+        (processes[1].id, "pay_id", "支付流水ID", "STRING"),
+        (processes[1].id, "pay_date", "支付日期", "DATE"),
+        (processes[1].id, "city_id", "城市ID", "INT"),
+        (processes[1].id, "category_id", "类目ID", "INT"),
+        (processes[1].id, "user_id", "用户ID", "INT"),
+        (processes[1].id, "pay_amount", "支付金额", "DECIMAL"),
+        (processes[1].id, "pay_channel", "支付渠道", "STRING"),
+        (processes[2].id, "refund_id", "退款ID", "STRING"),
+        (processes[2].id, "refund_date", "退款日期", "DATE"),
+        (processes[2].id, "city_id", "城市ID", "INT"),
+        (processes[2].id, "category_id", "类目ID", "INT"),
+        (processes[2].id, "pay_id", "原支付流水ID", "STRING"),
+        (processes[2].id, "refund_amount", "退款金额", "DECIMAL"),
+        (processes[2].id, "refund_reason", "退款原因", "STRING"),
+    ]
+    s.add_all([BusinessProcessField(process_id=pid, code=code, name=name, data_type=dtp)
+               for pid, code, name, dtp in process_fields])
 
     # 维度（需求文档 7.2.2）
     dims = [
@@ -277,8 +304,8 @@ def main():
         ds.definition_sql = SQLGenerator().generate_downstream_sql(ds)[0]
         s.commit()
         print("种子数据完成：元数据 + 物理事实表（30 天）")
-        for tbl in ["meta_atomic_metric", "meta_derived_metric", "meta_composite_metric",
-                    "meta_logical_model", "meta_downstream_model",
+        for tbl in ["meta_business_process_field", "meta_atomic_metric", "meta_derived_metric",
+                    "meta_composite_metric", "meta_logical_model", "meta_downstream_model",
                     "meta_downstream_app", "meta_dataset", "meta_app_dataset",
                     "dwd_order_detail", "dwd_pay_detail", "dwd_refund_detail"]:
             from sqlalchemy import text

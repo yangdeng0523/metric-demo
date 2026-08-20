@@ -73,6 +73,61 @@ def _walk_create_modal(page, f, btn_sel, tbl_sel, min_rows):
     page.wait_for_timeout(300)
 
 
+def walk_processes(page, opts):
+    f = []
+    if rows(page, "#tbl-processes") < 1:
+        f.append("#tbl-processes 行数 < 1")
+    page.click("#btn-new-process")
+    page.wait_for_timeout(400)
+    if not modal_open(page):
+        f.append("新建业务过程弹窗未打开")
+    page.click("#modal-cancel")
+    page.wait_for_timeout(300)
+    # 字段管理弹窗：字段行 >= 1 + 「从物理表导入」按钮（字段管理器用关闭按钮关闭，无取消键）
+    page.click('#tbl-processes tbody tr:first-child button[data-act="fields"]')
+    page.wait_for_timeout(700)
+    if not modal_open(page):
+        f.append("过程字段管理弹窗未打开（按钮 data-act=fields）")
+    else:
+        if page.locator("#modal-body .attr-row").count() < 1:
+            f.append("过程字段列表为空（seed 应带出各过程字段）")
+        if not has(page, "#pf-sync"):
+            f.append("「从物理表导入」按钮缺失")
+        page.click("#modal-close")
+        page.wait_for_timeout(300)
+    return f
+
+
+def walk_atomics(page, opts):
+    f = []
+    if rows(page, "#tbl-atomics") < 1:
+        f.append("#tbl-atomics 行数 < 1")
+    page.click("#btn-new-atomic")
+    page.wait_for_timeout(400)
+    if not modal_open(page):
+        f.append("新建原子指标弹窗未打开")
+        return f
+    # 物理字段应为下拉且自动带出默认业务过程（order）的字段
+    pf = page.locator("#f-physical_field")
+    if pf.count() == 0:
+        f.append("物理字段下拉缺失（应为 select 而非文本输入）")
+    else:
+        if pf.locator("option").count() < 1:
+            f.append("物理字段下拉无选项（默认业务过程未定义字段）")
+        if "（" not in pf.locator("option").first.inner_text():
+            f.append("物理字段选项未带出「字段名（显示名 · 类型）」格式")
+        # 切换业务过程（pay）→ 字段下拉应联动刷新
+        pid = page.locator("#f-process_id")
+        if pid.locator("option").count() >= 2:
+            pid.select_option(index=1)
+            page.wait_for_timeout(300)
+            if pf.locator("option").count() < 1:
+                f.append("切换业务过程后物理字段下拉未联动刷新")
+    page.click("#modal-cancel")
+    page.wait_for_timeout(300)
+    return f
+
+
 def walk_query(page, opts):
     f = []
     if rows(page, "#result-table") < 1:
@@ -109,10 +164,12 @@ def walk_reimport(page, opts):
         f.append("重导历史记录卡缺失")
     else:
         n = rows(page, "#tbl-reimport-history")
-        if n == 0:
-            if "暂无" not in text(page, "#tbl-reimport-history"):
-                f.append("重导历史空态提示缺失")
-        elif "手动" not in text(page, "#tbl-reimport-history tbody tr"):
+        first_text = text(page, "#tbl-reimport-history tbody tr")
+        if "暂无" in first_text:
+            pass  # 空态：允许（未执行过重导）
+        elif n == 0:
+            f.append("重导历史未渲染（无空态提示）")
+        elif "手动" not in first_text:
             f.append("重导历史首行触发方式应显示「手动」")
     page.click("#btn-reimport-history-refresh")
     page.wait_for_timeout(500)
@@ -206,8 +263,8 @@ def walk_lineage(page, opts):
 PAGES = [
     ("query",        "统一指标查询", walk_query),
     ("domains",      "主题域",     lambda p, o: _walk_create_modal(p, [], "#btn-new-domain",     "#tbl-domains", 1)),
-    ("processes",    "业务过程",   lambda p, o: _walk_create_modal(p, [], "#btn-new-process",    "#tbl-processes", 1)),
-    ("atomics",      "原子指标",   lambda p, o: _walk_create_modal(p, [], "#btn-new-atomic",     "#tbl-atomics", 1)),
+    ("processes",    "业务过程",   walk_processes),
+    ("atomics",      "原子指标",   walk_atomics),
     ("dims",         "维度与维度属性", lambda p, o: _walk_create_modal(p, [], "#btn-new-dim",  "#tbl-dims", 3)),
     ("derived",      "派生指标",   lambda p, o: _walk_create_modal(p, [], "#btn-new-derived",    "#tbl-derived", 1)),
     ("composites",   "复合指标",   lambda p, o: _walk_create_modal(p, [], "#btn-new-composite",  "#tbl-composites", 1)),

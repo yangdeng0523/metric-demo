@@ -91,8 +91,8 @@ cd metric-demo
 |---|------|--------|
 | 1 | 统一指标查询 | 默认自动查询出结果；多选指标 + 维度 + 日期范围 → 查询 → 汇总卡/表格/条形图/SQL 均更新；导出 Excel、复制 SQL |
 | 2 | 主题域 | 列表渲染 + 新建弹窗（编码规范校验） |
-| 3 | 业务过程 | 按域筛选 + 新建弹窗 |
-| 4 | 原子指标 | 列表 + 新建（业务过程 + 度量方式） |
+| 3 | 业务过程 | 按域筛选 + 新建弹窗 + **字段清单**（「字段」按钮 → 字段管理弹窗，含「从物理表导入真实列」一键补齐真实列） |
+| 4 | 原子指标 | 列表 + 新建（业务过程 + 度量方式；**选择业务过程后「物理字段」自动带出该过程字段下拉**，不可手填任意值） |
 | 5 | 维度管理 | 列表 + 新建（含属性、主键标记） |
 | 6 | 派生指标 | 列表 + 新建（时间周期/统计维度/筛选条件）|
 | 7 | 复合指标 | 列表 + 新建（四则运算，零值保护） |
@@ -129,8 +129,9 @@ cd metric-demo
 | 资源 | 接口 | 说明 |
 |------|------|------|
 | 主题域 | `POST/GET/PUT/DELETE /domains`、`GET /domains/{id}` | 分页搜索；删除校验下属业务过程/维度 |
-| 业务过程 | `POST/GET/PUT/DELETE /processes`、`GET /processes/{id}` | `?domain_id=` 筛选；详情含下属原子指标 |
-| 原子指标 | `POST/GET/PUT/DELETE /atomic-metrics`、`GET /atomic-metrics/{id}` | `?process_id=&status=&keyword=`；`PUT .../{id}/status` 发布/归档 |
+| 业务过程 | `POST/GET/PUT/DELETE /processes`、`GET /processes/{id}` | `?domain_id=` 筛选；详情含下属原子指标与字段清单 |
+| 业务过程字段 | `POST /processes/{id}/fields`、`GET /processes/{id}/fields`、`PUT/DELETE /business-process-fields/{field_id}`、`POST /processes/{id}/fields/sync` | 业务过程可度量/筛选/下钻的字段清单：编码（物理列名）+ 显示名 + 数据类型；`sync` 从物理表 `pragma_table_info` 一键导入真实列（幂等）；被原子指标引用的字段不可改名/删除（409） |
+| 原子指标 | `POST/GET/PUT/DELETE /atomic-metrics`、`GET /atomic-metrics/{id}` | `?process_id=&status=&keyword=`；`PUT .../{id}/status` 发布/归档；**定义/编辑时物理字段必须属于所选业务过程的字段清单**（未定义字段清单的过程不校验，向后兼容） |
 | 维度 | `POST/GET/PUT/DELETE /dimensions`、`GET /dimensions/{id}` | 详情含属性列表；删除校验被派生引用 |
 | 维度属性 | `POST /dimensions/{id}/attributes`、`PUT/DELETE /dimension-attributes/{attr_id}` | 含主键属性标记 |
 | 派生指标 | `POST/GET/PUT/DELETE /derived-metrics`、`GET .../{id}` | 时间周期 + 统计维度 + 筛选条件；`GET .../{id}/sql-preview` |

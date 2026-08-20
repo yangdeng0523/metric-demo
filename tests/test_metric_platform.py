@@ -302,6 +302,103 @@ def test_dimension_attribute_crud(api):
 
 
 # ===========================================================================
+# 业务过程字段（定义原子指标时自动带出的字段清单）
+# ===========================================================================
+
+def test_process_fields_list_and_count(api):
+    """过程列表/详情携带 fields 与 fields_count（前端自动带出的数据源）"""
+    d = api.get("/api/v1/processes").json()["data"]
+    order = next(p for p in d if p["code"] == "order")
+    assert order["fields_count"] == len(order["fields"]) >= 7
+    assert any(f["code"] == "order_amount" and f["data_type"] == "DECIMAL"
+               for f in order["fields"])
+    r = api.get("/api/v1/processes/1/fields")
+    assert r.status_code == 200
+    assert any(f["code"] == "order_id" for f in r.json()["data"])
+
+
+def test_process_field_crud(api):
+    """业务过程字段：新增 / 重码 409 / 改名 / 删除"""
+    r = api.post("/api/v1/processes/1/fields",
+                 json={"code": "test_field", "name": "测试字段", "data_type": "DECIMAL"})
+    assert r.status_code == 200
+    fid = r.json()["data"]["id"]
+    p = api.get("/api/v1/processes/1").json()["data"]
+    assert any(f["id"] == fid and f["code"] == "test_field" for f in p["fields"])
+    # 同名重码 -> 409
+    r = api.post("/api/v1/processes/1/fields",
+                 json={"code": "test_field", "name": "重复", "data_type": "STRING"})
+    assert r.status_code == 409
+    # 非法字段名 -> 400
+    r = api.post("/api/v1/processes/1/fields",
+                 json={"code": "bad-name!", "name": "坏名", "data_type": "STRING"})
+    assert r.status_code == 400
+    # 未引用字段改名 -> 200
+    r = api.put(f"/api/v1/business-process-fields/{fid}",
+                json={"code": "test_field2", "name": "测试字段2", "data_type": "DECIMAL"})
+    assert r.status_code == 200
+    # 删除 -> 200
+    r = api.delete(f"/api/v1/business-process-fields/{fid}")
+    assert r.status_code == 200
+
+
+def test_process_field_sync_from_physical_table(api):
+    """一键导入：新业务过程 sync -> 从物理表拉取真实列（幂等）"""
+    r = api.post("/api/v1/processes", json={
+        "code": "test_proc_sync", "name": "同步测试过程", "domain_id": 1,
+        "physical_table": "dwd_pay_detail", "date_field": "pay_date"})
+    assert r.status_code == 200
+    pid = r.json()["data"]["id"]
+    r = api.post(f"/api/v1/processes/{pid}/fields/sync")
+    assert r.status_code == 200
+    d = r.json()["data"]
+    assert "pay_id" in d["added"] and "pay_amount" in d["added"]
+    # 幂等：再次同步无新增
+    d2 = api.post(f"/api/v1/processes/{pid}/fields/sync").json()["data"]
+    assert d2["added"] == []
+    api.delete(f"/api/v1/processes/{pid}")  # 清理（级联删除字段）
+
+
+def test_delete_rename_referenced_field_blocked(api):
+    """被原子指标引用的字段：删除 / 改名均 409（物理列级联引用保护）"""
+    p = api.get("/api/v1/processes/1").json()["data"]
+    fid = next(f["id"] for f in p["fields"] if f["code"] == "order_amount")
+    r = api.delete(f"/api/v1/business-process-fields/{fid}")
+    assert r.status_code == 409
+    r = api.put(f"/api/v1/business-process-fields/{fid}",
+                json={"code": "order_amount_x", "name": "x", "data_type": "DECIMAL"})
+    assert r.status_code == 409
+    assert "原子指标" in r.json()["message"]
+
+
+def test_atomic_physical_field_must_belong_to_process(api):
+    """原子指标度量字段必须属于业务过程字段（自动带出 + 后端强校验）"""
+    # 字段不属于该过程 -> 400，且提示可选字段
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "test_bad_field", "name": "坏字段", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "not_exist_col",
+        "data_type": "DECIMAL", "unit": "元", "description": ""})
+    assert r.status_code == 400
+    msg = r.json()["message"]
+    assert "不存在于业务过程" in msg and "order_amount" in msg
+    # 属于该过程 -> 200（随后清理）
+    r = api.post("/api/v1/atomic-metrics", json={
+        "code": "test_good_field", "name": "好字段", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "order_amount",
+        "data_type": "DECIMAL", "unit": "元", "description": ""})
+    assert r.status_code == 200
+    api.delete(f"/api/v1/atomic-metrics/{r.json()['data']['id']}")
+    # 更新同样强校验：换到其他过程字段 -> 400（code 保持不变）
+    m = next(x for x in api.get("/api/v1/atomic-metrics?page_size=100").json()["data"]["items"]
+             if x["code"] == "order_amount_sum")
+    r = api.put(f"/api/v1/atomic-metrics/{m['id']}", json={
+        "code": "order_amount_sum", "name": "下单金额", "process_id": 1,
+        "agg_function": "SUM", "physical_field": "pay_amount",
+        "data_type": "DECIMAL", "unit": "元", "description": ""})
+    assert r.status_code == 400
+
+
+# ===========================================================================
 # Excel 导出
 # ===========================================================================
 

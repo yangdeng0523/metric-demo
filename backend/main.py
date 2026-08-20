@@ -34,7 +34,7 @@ from sqlalchemy import func, or_, text
 
 from models import (
     get_session, engine, STATUS_DRAFT, STATUS_PUBLISHED,
-    SubjectDomain, BusinessProcess, Dimension, DimensionAttribute,
+    SubjectDomain, BusinessProcess, BusinessProcessField, Dimension, DimensionAttribute,
     AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
     DownstreamApp, Dataset, AppDatasetGrant, ApiCallLog,
     MetricVersion, Approval, QualityRule, Alert, TaskInstance, Schedule,
@@ -105,6 +105,19 @@ def _check_dims(s, dim_codes: list):
     for dc in dim_codes or []:
         if not s.query(Dimension).filter_by(code=dc).first():
             raise HTTPException(400, f"维度不存在: {dc}")
+
+
+def _field_dict(f):
+    return {"id": f.id, "code": f.code, "name": f.name, "data_type": f.data_type}
+
+
+def _check_physical_field(s, process, physical_field: str):
+    """原子指标度量字段必须属于业务过程已定义字段（过程未定义字段时宽松兼容）"""
+    fields = s.query(BusinessProcessField).filter_by(process_id=process.id).all()
+    if fields and not any(f.code == physical_field for f in fields):
+        options = "、".join(f.code for f in fields)
+        raise HTTPException(
+            400, f"物理字段 {physical_field} 不存在于业务过程 {process.name} 的字段列表中，可选: {options}")
 
 
 def _refs_in_downstream(s, metric_code=None, dim_code=None):
@@ -318,6 +331,12 @@ class AttrIn(BaseModel):
     data_type: str = "STRING"
 
 
+class ProcessFieldIn(BaseModel):
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
+    data_type: str = Field("STRING", max_length=32)
+
+
 class DerivedIn(BaseModel):
     code: str = Field(..., max_length=64)
     name: str = Field(..., max_length=128)
@@ -487,6 +506,8 @@ def list_processes(domain_id: Optional[int] = None, keyword: str = ""):
             "physical_table": p.physical_table, "date_field": p.date_field,
             "description": p.description,
             "atomic_count": s.query(AtomicMetric).filter_by(process_id=p.id).count(),
+            "fields": [_field_dict(f) for f in p.fields],
+            "fields_count": len(p.fields),
         } for p in rows]
         return ok(items)
     finally:
@@ -506,7 +527,9 @@ def get_process(process_id: int):
             "id": p.id, "code": p.code, "name": p.name,
             "domain_id": p.domain_id, "domain_name": p.domain_name,
             "physical_table": p.physical_table, "date_field": p.date_field,
-            "description": p.description, "atomics": atomics,
+            "description": p.description,
+            "fields": [_field_dict(f) for f in p.fields],
+            "atomics": atomics,
         })
     finally:
         s.close()
@@ -544,6 +567,108 @@ def delete_process(process_id: int):
         s.close()
 
 
+# ---- 业务过程字段 ----
+
+@router.get("/processes/{process_id}/fields", tags=["业务过程"])
+def list_process_fields(process_id: int):
+    s = get_session()
+    try:
+        _get_or_404(s, BusinessProcess, process_id, "业务过程")
+        rows = (s.query(BusinessProcessField)
+                .filter_by(process_id=process_id)
+                .order_by(BusinessProcessField.id).all())
+        return ok([_field_dict(f) for f in rows])
+    finally:
+        s.close()
+
+
+@router.post("/processes/{process_id}/fields", tags=["业务过程"])
+def add_process_field(process_id: int, body: ProcessFieldIn):
+    s = get_session()
+    try:
+        p = _get_or_404(s, BusinessProcess, process_id, "业务过程")
+        if not body.code or not str(body.code).replace("_", "").isalnum():
+            raise HTTPException(400, "字段名只能包含字母、数字、下划线")
+        if any(f.code == body.code for f in p.fields):
+            raise HTTPException(409, f"字段已存在: {body.code}")
+        f = BusinessProcessField(process_id=process_id, **body.dict())
+        s.add(f)
+        s.commit()
+        return ok({"id": f.id, "code": f.code})
+    finally:
+        s.close()
+
+
+@router.put("/business-process-fields/{field_id}", tags=["业务过程"])
+def update_process_field(field_id: int, body: ProcessFieldIn):
+    s = get_session()
+    try:
+        f = _get_or_404(s, BusinessProcessField, field_id, "业务过程字段")
+        if not str(body.code).replace("_", "").isalnum():
+            raise HTTPException(400, "字段名只能包含字母、数字、下划线")
+        dup = (s.query(BusinessProcessField)
+               .filter_by(process_id=f.process_id, code=body.code)
+               .filter(BusinessProcessField.id != field_id).first())
+        if dup:
+            raise HTTPException(409, f"字段已存在: {body.code}")
+        if body.code != f.code:
+            # 被原子指标引用的字段禁止改名（级联引用为物理列名，需先调整原子指标）
+            n = (s.query(AtomicMetric)
+                 .filter_by(process_id=f.process_id, physical_field=f.code).count())
+            if n:
+                raise HTTPException(
+                    409, f"字段 {f.code} 被 {n} 个原子指标引用，请先调整原子指标后再改名")
+        for k, v in body.dict().items():
+            setattr(f, k, v)
+        s.commit()
+        return ok({"id": f.id})
+    finally:
+        s.close()
+
+
+@router.delete("/business-process-fields/{field_id}", tags=["业务过程"])
+def delete_process_field(field_id: int):
+    s = get_session()
+    try:
+        f = _get_or_404(s, BusinessProcessField, field_id, "业务过程字段")
+        n = (s.query(AtomicMetric)
+             .filter_by(process_id=f.process_id, physical_field=f.code).count())
+        if n:
+            raise HTTPException(
+                409, f"字段 {f.code} 被 {n} 个原子指标引用，禁止删除（请先调整原子指标）")
+        s.delete(f)
+        s.commit()
+        return ok({"deleted": field_id})
+    finally:
+        s.close()
+
+
+@router.post("/processes/{process_id}/fields/sync", tags=["业务过程"])
+def sync_process_fields(process_id: int):
+    """从物理表一键导入真实列（pragma_table_info，跳过代理主键 id），已存在字段跳过（幂等）"""
+    s = get_session()
+    try:
+        p = _get_or_404(s, BusinessProcess, process_id, "业务过程")
+        rows = s.execute(text("SELECT name FROM pragma_table_info(:t) WHERE pk = 0"),
+                         {"t": p.physical_table}).fetchall()
+        columns = sorted(r[0] for r in rows)
+        if not columns:
+            raise HTTPException(400, f"物理表 {p.physical_table} 不存在或无列，无法同步")
+        existing = {f.code for f in p.fields}
+        added = []
+        for col in columns:
+            if col in existing:
+                continue
+            s.add(BusinessProcessField(process_id=process_id, code=col,
+                                       name=col, data_type="STRING"))
+            added.append(col)
+        s.commit()
+        return ok({"added": added, "skipped": len(columns) - len(added),
+                   "total": len(columns)})
+    finally:
+        s.close()
+
+
 # ===========================================================================
 # 5.3 原子指标管理
 # ===========================================================================
@@ -554,10 +679,11 @@ def create_atomic(body: AtomicIn):
     try:
         _check_code(s, AtomicMetric, body.code)
         _check_code_rule(s, "atomic_metric", body.code)
-        _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
+        process = _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
         if body.agg_function not in AGG_FUNCTIONS:
             raise HTTPException(400, f"非法聚合方式: {body.agg_function}，可选 {AGG_FUNCTIONS}")
         _check_status_arg(body.status)
+        _check_physical_field(s, process, body.physical_field)
         a = AtomicMetric(**body.dict())
         s.add(a)
         s.commit()
@@ -627,10 +753,11 @@ def update_atomic(metric_id: int, body: AtomicIn):
         m = _get_or_404(s, AtomicMetric, metric_id, "原子指标")
         _check_code(s, AtomicMetric, body.code, exclude_id=metric_id)
         _check_code_rule(s, "atomic_metric", body.code)
-        _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
+        process = _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
         if body.agg_function not in AGG_FUNCTIONS:
             raise HTTPException(400, f"非法聚合方式: {body.agg_function}")
         _check_status_arg(body.status)
+        _check_physical_field(s, process, body.physical_field)
         _snapshot_version(s, "atomic_metric", m, "update", "编辑更新")
         for k, v in body.dict().items():
             setattr(m, k, v)

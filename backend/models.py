@@ -67,6 +67,8 @@ class BusinessProcess(Base):
     created_at = Column(DateTime, default=now)
     updated_at = Column(DateTime, default=now, onupdate=now)
     domain = relationship("SubjectDomain")
+    fields = relationship("BusinessProcessField", cascade="all, delete-orphan",
+                          order_by="BusinessProcessField.id")
 
     @property
     def domain_name(self):
@@ -103,6 +105,20 @@ class DimensionAttribute(Base):
     name = Column(String(128), nullable=False)
     physical_field = Column(String(64), nullable=False)
     data_type = Column(String(32), default="STRING")
+
+
+class BusinessProcessField(Base):
+    """业务过程字段：业务过程物理表可度量/筛选/下钻的字段清单（需求文档 4.1.2 扩展）
+    定义原子指标时从该列表中带出可选项，防止手填不存在的物理列"""
+    __tablename__ = "meta_business_process_field"
+    id = Column(Integer, primary_key=True)
+    process_id = Column(Integer, ForeignKey("meta_business_process.id"), nullable=False)
+    code = Column(String(64), nullable=False)     # 字段名（物理列名）
+    name = Column(String(128), nullable=False)    # 显示名
+    data_type = Column(String(32), default="STRING")
+    __table_args__ = (
+        UniqueConstraint("process_id", "code", name="uq_process_field_code"),
+    )
 
 
 class AtomicMetric(Base):

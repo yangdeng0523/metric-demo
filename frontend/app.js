@@ -101,6 +101,7 @@ function openModal({ title, fields = [], value = {}, width = 560, hint = "", onO
   $("modal").style.width = width + "px";
   $("modal-msg").textContent = "";
   $("modal-ok").style.display = "";          // 恢复（SQL 预览弹窗曾隐藏）
+  $("modal-cancel").style.display = "";      // 恢复（属性/字段管理弹窗曾隐藏）
   $("modal-cancel").textContent = "取 消";
   $("modal-cancel").onclick = closeModal;
   const body = $("modal-body");
@@ -135,6 +136,7 @@ function openModal({ title, fields = [], value = {}, width = 560, hint = "", onO
           sel.appendChild(op);
         }
         if (v !== "" && v !== null && v !== undefined) sel.value = v;
+        if (f.onChange) sel.onchange = () => f.onChange(sel);  // 联动：如切换业务过程后刷新字段下拉
         wrap.appendChild(sel);
         break;
       }
@@ -657,15 +659,17 @@ async function domainForm(id) {
 function renderProcesses() {
   const kw = $("kw-processes").value.trim();
   api(`/processes${kw ? "?keyword=" + encodeURIComponent(kw) : ""}`).then(list => {
-    $("tbl-processes").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>主题域</th><th>物理表</th><th>日期字段</th><th>原子指标数</th><th style="width:170px">操作</th></tr></thead>
+    $("tbl-processes").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>主题域</th><th>物理表</th><th>日期字段</th><th>字段</th><th>原子指标数</th><th style="width:240px">操作</th></tr></thead>
       <tbody>${(list || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td><td>${esc(x.domain_name)}</td>
         <td><span class="tag">${esc(x.physical_table)}</span></td><td><code>${esc(x.date_field)}</code></td>
+        <td>${(x.fields || []).map(f => `<span class="tag attr" title="${esc(f.code)} · ${esc(f.data_type)}">${esc(f.name)}</span>`).join("") || '<span class="hint-text">-</span>'}</td>
         <td class="num">${x.atomic_count}</td>
         <td>
+          <button class="btn-ghost btn-sm" data-act="fields" data-id="${x.id}" title="维护业务过程字段清单，定义原子指标时自动带出">字段</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
-        </td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无业务过程</td></tr>`}</tbody>`;
+        </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无业务过程</td></tr>`}</tbody>`;
   });
 }
 
@@ -689,6 +693,73 @@ async function processForm(id) {
       await refreshAll();
     },
   });
+}
+
+// 业务过程字段管理弹窗：维护字段清单（定义原子指标时自动带出），支持从物理表一键导入
+async function processFieldManager(processId) {
+  const p = (await api(`/processes/${processId}`));
+  const listRow = f => `<div class="attr-row">
+      <div><b>${esc(f.name)}</b><span class="hint-text">${esc(f.code)} · ${esc(f.data_type)}</span></div>
+      <button class="btn-ghost btn-sm danger" data-del-field="${f.id}" title="被原子指标引用的字段禁止删除">删除</button></div>`;
+  $("modal-title").textContent = `业务过程字段 · ${p.name}`;
+  $("modal").style.width = "620px";
+  $("modal-msg").textContent = "";
+  $("modal-body").innerHTML = `
+    <div style="margin-bottom:10px">
+      <span class="hint-text">物理表：<code>${esc(p.physical_table)}</code>；定义原子指标时自动带出以下字段</span>
+      <button class="btn-ghost btn-sm" id="pf-sync" style="float:right">⇄ 从物理表导入真实列</button>
+    </div>
+    <div class="attr-list">${(p.fields || []).map(listRow).join("") || '<p class="empty">暂无字段，可手动添加或从物理表一键导入</p>'}</div>
+    <div class="attr-add">
+      <div class="form-grid">
+        <div class="field"><label>字段编码（物理列名）*</label><input id="pf-code" placeholder="如 pay_amount"></div>
+        <div class="field"><label>字段名称 *</label><input id="pf-name" placeholder="如 支付金额"></div>
+        <div class="field"><label>数据类型</label><select id="pf-type"><option>STRING</option><option>INT</option><option>DECIMAL</option><option>DATE</option></select></div>
+      </div>
+      <button class="btn-primary btn-sm" style="margin-top:12px" id="pf-add">+ 添加字段</button>
+      <span class="hint-text" id="pf-msg"></span>
+    </div>`;
+  $("modal-backdrop").classList.add("open");
+  $("modal-ok").style.display = "none";
+  $("modal-cancel").style.display = "none";
+  $("modal-close").onclick = closeModal;
+  $("modal-backdrop").onclick = e => { if (e.target === $("modal-backdrop")) closeModal(); };
+  $("pf-add").onclick = async () => {
+    const body = { code: $("pf-code").value.trim(), name: $("pf-name").value.trim(),
+                   data_type: $("pf-type").value };
+    if (!body.code || !body.name) { $("pf-msg").textContent = "请填写字段编码和名称"; return; }
+    try {
+      await post(`/processes/${processId}/fields`, body);
+      $("pf-msg").textContent = "已添加";
+      await processFieldManager(processId);
+    } catch (e) { $("pf-msg").textContent = e.message; }
+    await refreshAll();
+  };
+  document.querySelectorAll("[data-del-field]").forEach(b => b.onclick = async () => {
+    try {
+      await del(`/business-process-fields/${b.dataset.delField}`);
+      await processFieldManager(processId);
+    } catch (e) { toast(e.message, false); }
+    await refreshAll();
+  });
+  $("pf-sync").onclick = async () => {
+    try {
+      const r = await post(`/processes/${processId}/fields/sync`, {});
+      $("pf-msg").textContent = r.added.length
+        ? `已从物理表导入 ${r.added.length} 个字段：${r.added.join("、")}` : "没有新字段（已全部同步）";
+      await processFieldManager(processId);
+    } catch (e) { $("pf-msg").textContent = e.message; }
+    await refreshAll();
+  };
+}
+
+// 业务过程字段下拉选项（原子指标表单）：返回该过程已定义字段；extra 为历史值（不在列表内时保留）
+function processFieldOptions(processId, extra) {
+  const p = PROCESSES.find(x => x.id === Number(processId));
+  let opts = (p?.fields || []).map(f => ({ value: f.code, label: `${f.code}（${f.name} · ${f.data_type}）` }));
+  if (extra && !opts.some(o => o.value === extra)) opts = [{ value: extra, label: `${extra}（历史值）` }, ...opts];
+  if (!opts.length) opts = [{ value: "", label: "（该过程未定义字段，请先在业务过程页「字段」中导入）" }];
+  return opts;
 }
 
 // ---------------------------------------------------------------- 原子指标
@@ -735,9 +806,20 @@ async function atomicForm(id) {
     fields: [
       { key: "code", label: "编码", type: "text", required: true, placeholder: "如 pay_amount_sum" },
       { key: "name", label: "名称", type: "text", required: true, placeholder: "如 支付金额" },
-      { key: "process_id", label: "所属业务过程", type: "select", required: true, options: PROCESSES.map(p => ({ value: p.id, label: p.name })) },
+      { key: "process_id", label: "所属业务过程", type: "select", required: true,
+        options: PROCESSES.map(p => ({ value: p.id, label: p.name })),
+        onChange: sel => {
+          // 切换业务过程 → 自动带出该过程的字段清单
+          const pf = document.getElementById("f-physical_field");
+          if (!pf) return;
+          pf.innerHTML = processFieldOptions(sel.value).map(o =>
+            `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
+          if (!pf.value && pf.options.length) pf.value = pf.options[0].value;
+        } },
       { key: "agg_function", label: "聚合方式", type: "select", required: true, options: AGG_FUNCTIONS.map(a => ({ value: a, label: a })) },
-      { key: "physical_field", label: "物理字段", type: "text", required: true, placeholder: "如 pay_amount" },
+      { key: "physical_field", label: "物理字段", type: "select", required: true,
+        hint: "自动带出所选业务过程的字段，无需手填",
+        options: () => processFieldOptions(v.process_id, v.physical_field) },
       { key: "data_type", label: "数据类型", type: "select", options: ["DECIMAL", "INT", "BIGINT", "STRING", "DATE"].map(a => ({ value: a, label: a })) },
       { key: "unit", label: "单位", type: "text", placeholder: "如 元 / 次" },
       { key: "status", label: "状态", type: "status" },
@@ -2344,7 +2426,8 @@ function bindEvents() {
     const btn = e.target.closest("button[data-act]");
     if (!btn) return;
     const id = Number(btn.dataset.id);
-    if (btn.dataset.act === "edit") processForm(id);
+    if (btn.dataset.act === "fields") processFieldManager(id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "edit") processForm(id);
     else if (btn.dataset.act === "del") confirmDelete("删除该业务过程？", () => del(`/processes/${id}`));
   });
 
