@@ -8,7 +8,7 @@ import datetime as dt
 from sqlalchemy import text
 from sqlalchemy.orm import joinedload
 
-from models import get_session, AtomicMetric, DerivedMetric, CompositeMetric, Dimension
+from models import get_session, AtomicMetric, DerivedMetric, CompositeMetric, Dimension, MetricModifier
 
 # SQLite 安全白名单校验
 import re
@@ -193,45 +193,194 @@ class SQLGenerator:
         )
         return sql, where_params
 
-    def build_derived_sql(self, metric: DerivedMetric, dim_codes=None,
-                          start_date=None, end_date=None, prefix="",
-                          bucket_fmt=None):
-        """派生指标 SQL：原子指标 + 时间周期 + 统计维度 + 业务限定"""
-        use_dims = dim_codes if dim_codes is not None else (metric.dim_codes or [])
-        start, end = self.resolve_period(metric.time_period, start_date, end_date)
-        filters = list(metric.filters or [])
-        return self.build_atomic_sql(metric.atomic, use_dims, start, end,
-                                     filters, prefix, bucket_fmt)
-
-    def build_composite_sql(self, metric: CompositeMetric, dim_codes=None,
-                            start_date=None, end_date=None, bucket_fmt=None):
-        """复合指标 SQL：各派生指标生成子查询，按维度/日期桶 JOIN 后套表达式"""
-        if not metric.ref_codes:
-            raise ValueError(f"复合指标 {metric.code} 未配置引用指标")
+    @staticmethod
+    def resolve_derived_config(metric: DerivedMetric):
+        """派生指标口径解析：引用修饰词库时以库为准（可复用、改库即改口径），
+        否则回退到派生指标内嵌配置（兼容旧数据）。
+        返回 (time_period, dim_codes, filters)"""
+        if not (metric.modifier_codes or []):
+            return (metric.time_period, list(metric.dim_codes or []),
+                    list(metric.filters or []))
         s = get_session()
         try:
-            derived_list = []
-            for ref in metric.ref_codes:
-                dm = (s.query(DerivedMetric)
-                      .options(joinedload(DerivedMetric.atomic).joinedload(AtomicMetric.process))
-                      .filter_by(code=ref).first())
-                if not dm:
-                    raise ValueError(f"引用的派生指标不存在: {ref}")
-                derived_list.append(dm)
+            period, dims, filters = None, [], []
+            for code in metric.modifier_codes:
+                mod = s.query(MetricModifier).filter_by(code=code).first()
+                if not mod:
+                    raise ValueError(f"引用的修饰词不存在或已停用: {code}")
+                cfg = mod.config or {}
+                if mod.modifier_type == "time_period":
+                    period = cfg.get("period") or metric.time_period
+                elif mod.modifier_type == "business_filter":
+                    filters.extend(cfg.get("filters") or [])
+                elif mod.modifier_type == "granularity":
+                    dims.extend(cfg.get("dim_codes") or [])
+            return (period or metric.time_period, dims, filters)
         finally:
             s.close()
 
-        # 有效维度：显式传入优先，否则取首个被引用派生指标的统计维度
-        eff_dims = dim_codes if dim_codes is not None else (derived_list[0].dim_codes or [])
+    def build_derived_sql(self, metric: DerivedMetric, dim_codes=None,
+                          start_date=None, end_date=None, prefix="",
+                          bucket_fmt=None):
+        """派生指标 SQL：原子指标 + 修饰词（时间周期/统计粒度/业务限定）。
+        compare_type 非 none 时自动派生 同比(yoy)/环比(mom)/累计(cumulative) 列：
+        metric_yoy / metric_mom / metric_cum（bucket 粒度查询逐桶计算）"""
+        period, lib_dims, lib_filters = self.resolve_derived_config(metric)
+        use_dims = dim_codes if dim_codes is not None else (lib_dims or [])
+        start, end = self.resolve_period(period, start_date, end_date)
+        filters = lib_filters if (metric.modifier_codes or []) else list(metric.filters or [])
+        base_sql, base_params = self.build_atomic_sql(
+            metric.atomic, use_dims, start, end, filters, prefix, bucket_fmt)
+        compare = metric.compare_type or "none"
+        if compare == "none" or (compare == "cumulative" and not bucket_fmt):
+            return base_sql, base_params
+        sql, extra_params = self._wrap_compare(
+            metric.atomic, base_sql, use_dims, start, end,
+            filters, prefix, bucket_fmt, compare)
+        base_params.update(extra_params)
+        return sql, base_params
+
+    # ------------------------------------------------------------------
+    # 同环比 / 累计 自动派生
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bucket_shift_expr(bucket_fmt: str, base_col: str, years=0, days=0, months=0) -> str:
+        """由当前日期桶计算偏移桶（同比/环比），strftime 支持 'YYYY-Www-1' ISO 周格式"""
+        src = base_col
+        if bucket_fmt == "%Y-%m":
+            src = f"{base_col} || '-01'"
+        elif bucket_fmt == "%Y-W%W":
+            src = f"{base_col} || '-1'"
+        mods = []
+        if years:
+            mods.append(f"'{years} year'")
+        if months:
+            mods.append(f"'{months} month'")
+        if days:
+            mods.append(f"'{days} days'")
+        return f"strftime('{bucket_fmt}', {src}{', ' + ', '.join(mods) if mods else ''})"
+
+    @staticmethod
+    def _shift_year(d: dt.date, years: int = 1) -> dt.date:
+        """年份平移（2/29 闰日回退到 2/28，避免日期不存在）"""
+        try:
+            return d.replace(year=d.year - years)
+        except ValueError:
+            return d.replace(year=d.year - years, day=28)
+
+    def _wrap_compare(self, atomic, base_sql, use_dims, start, end, filters,
+                      prefix, bucket_fmt, compare):
+        """将基础聚合子查询包装为同环比/累计查询：
+        同比：同日期桶去年（bucket）/ 同窗口去年；环比：前一日期桶 / 前一同长窗口；
+        累计：窗口内按日期桶滚动求和（需 bucket 粒度）。
+        输出列：metric_yoy / metric_mom / metric_cum"""
+        has_bucket = bool(bucket_fmt)
+        select_parts = ["b.metric_value"]
+        joins = []
+        merged = {}
+
+        def join_on_dims(alias):
+            if use_dims:
+                return " AND ".join(f"b.{d} = {alias}.{d}" for d in use_dims)
+            return "1 = 1"
+
+        if compare in ("yoy", "yoy_mom"):
+            if has_bucket:
+                yoy_expr = self._bucket_shift_expr(
+                    bucket_fmt, "b.date_bucket", years=1)
+                ystart = self._shift_year(start)
+                yoy_sql, yp = self.build_atomic_sql(
+                    atomic, use_dims, ystart, end, filters, prefix + "y", bucket_fmt)
+                merged.update(yp)
+                select_parts.append("y.metric_value AS metric_yoy")
+                on = f"y.date_bucket = {yoy_expr}"
+                if use_dims:
+                    on += " AND " + join_on_dims("y")
+            else:
+                ystart = self._shift_year(start)
+                yend = self._shift_year(end)
+                yoy_sql, yp = self.build_atomic_sql(
+                    atomic, use_dims, ystart, yend, filters, prefix + "y", None)
+                merged.update(yp)
+                select_parts.append("y.metric_value AS metric_yoy")
+                on = join_on_dims("y")
+            joins.append(f"LEFT JOIN (\n{yoy_sql}\n) y ON {on}")
+
+        if compare in ("mom", "yoy_mom"):
+            length = (end - start).days + 1
+            if has_bucket:
+                mom_expr = self._bucket_shift_expr(
+                    bucket_fmt, "b.date_bucket",
+                    days=1 if bucket_fmt == "%Y-%m-%d"
+                    else (7 if bucket_fmt == "%Y-W%W" else 0),
+                    months=1 if bucket_fmt == "%Y-%m" else 0)
+                mstart = start - dt.timedelta(days=length)
+                mom_sql, mp = self.build_atomic_sql(
+                    atomic, use_dims, mstart, end, filters, prefix + "m", bucket_fmt)
+                on = f"m.date_bucket = {mom_expr}"
+            else:
+                mstart = start - dt.timedelta(days=length)
+                mend = start - dt.timedelta(days=1)
+                mom_sql, mp = self.build_atomic_sql(
+                    atomic, use_dims, mstart, mend, filters, prefix + "m", None)
+                on = join_on_dims("m")
+            merged.update(mp)
+            select_parts.append("m.metric_value AS metric_mom")
+            if has_bucket and use_dims:
+                on += " AND " + join_on_dims("m")
+            joins.append(f"LEFT JOIN (\n{mom_sql}\n) m ON {on}")
+
+        if compare == "cumulative" and has_bucket:
+            if use_dims:
+                partition = (f"PARTITION BY {', '.join('b.' + d for d in use_dims)} ")
+            else:
+                partition = ""
+            select_parts.append(
+                f"SUM(b.metric_value) OVER ({partition}ORDER BY b.date_bucket) "
+                f"AS metric_cum")
+
+        bucket_col = ", b.date_bucket" if has_bucket else ""
+        dim_cols = (", " + ", ".join(f"b.{d}" for d in use_dims)) if use_dims else ""
+        sql = (f"SELECT {', '.join(select_parts)}{bucket_col}{dim_cols}\n"
+               f"FROM (\n{base_sql}\n) b\n" + "\n".join(joins))
+        return sql, merged
+
+    def build_composite_sql(self, metric: CompositeMetric, dim_codes=None,
+                            start_date=None, end_date=None, bucket_fmt=None):
+        """复合指标 SQL：各引用指标（派生/原子）生成子查询，按维度/日期桶 JOIN 后套表达式"""
+        if not metric.ref_codes:
+            raise ValueError(f"复合指标 {metric.code} 未配置引用指标")
+        # 引用指标可为派生指标（自带时间周期/限定）或原子指标（取查询窗口，默认最近 7 天）
+        ref_list = []
+        for ref in metric.ref_codes:
+            rtype, rmetric = self.find_metric(ref)
+            ref_list.append((rtype, rmetric))
+
+        # 有效维度：显式传入优先，否则取首个被引用派生指标的统计维度（原子指标无维度定义）
+        eff_dims = dim_codes
+        if eff_dims is None:
+            for rtype, rmetric in ref_list:
+                if rtype == "derived" and (rmetric.dim_codes or []):
+                    eff_dims = rmetric.dim_codes
+                    break
+        eff_dims = eff_dims or []
         has_dims = bool(eff_dims)
 
         subs, merged_params = [], {}
-        for i, dm in enumerate(derived_list):
-            sub_sql, sub_params = self.build_derived_sql(
-                dm, eff_dims, start_date, end_date, prefix=f"s{i}",
-                bucket_fmt=bucket_fmt)
+        for i, (rtype, rmetric) in enumerate(ref_list):
+            if rtype == "derived":
+                sub_sql, sub_params = self.build_derived_sql(
+                    rmetric, eff_dims, start_date, end_date, prefix=f"s{i}",
+                    bucket_fmt=bucket_fmt)
+            else:
+                start, end = self.resolve_period(
+                    "custom", start_date or _default_start(), end_date)
+                sub_sql, sub_params = self.build_atomic_sql(
+                    rmetric, eff_dims, start, end, None, prefix=f"s{i}",
+                    bucket_fmt=bucket_fmt)
             merged_params.update(sub_params)
-            subs.append((f"t{i}", dm.code, sub_sql))
+            subs.append((f"t{i}", rmetric.code, sub_sql))
 
         select_expr = metric.expression
         for alias, ref, _ in subs:
@@ -305,18 +454,14 @@ class SQLGenerator:
             return {metric.process.physical_table}
         if mtype == "derived":
             return {metric.atomic.process.physical_table}
-        # 复合指标：所有被引用派生指标的物理表
+        # 复合指标：所有被引用指标（派生/原子）的物理表
         tables = set()
-        s = get_session()
-        try:
-            for ref in metric.ref_codes or []:
-                dm = (s.query(DerivedMetric)
-                      .options(joinedload(DerivedMetric.atomic).joinedload(AtomicMetric.process))
-                      .filter_by(code=ref).first())
-                if dm:
-                    tables.add(dm.atomic.process.physical_table)
-        finally:
-            s.close()
+        for ref in metric.ref_codes or []:
+            try:
+                rtype, rmetric = SQLGenerator.find_metric(ref)
+            except MetricNotFoundError:
+                continue
+            tables |= SQLGenerator._metric_physical_tables(rtype, rmetric)
         return tables
 
     @staticmethod
@@ -344,11 +489,12 @@ class SQLGenerator:
 
         dims = [self.resolve_dimension(dc) for dc in dim_codes]
 
-        mtypes, mnames, subs, merged_params = [], [], [], {}
+        mtypes, mnames, subs, merged_params, metrics = [], [], [], {}, []
         for i, code in enumerate(metric_codes):
             mtype, metric = self.find_metric(code)
             mtypes.append(mtype)
             mnames.append(metric.name)
+            metrics.append((mtype, metric))
 
             # 维度兼容校验：维度关联字段必须存在于指标涉及的物理表中
             tables = self._metric_physical_tables(mtype, metric)
@@ -378,6 +524,15 @@ class SQLGenerator:
                         + [f"m0.{dc}" for dc in dim_codes]
                         + [f"{alias}.metric_value AS {_safe_ident(c)}"
                            for alias, c, _ in subs])
+        # 派生指标同环比/累计自动派生列：metric_yoy/metric_mom/metric_cum 透出到结果
+        for (alias, code, _sub_sql), (mtype, metric) in zip(subs, metrics):
+            if mtype != "derived":
+                continue
+            compare = metric.compare_type or "none"
+            for col in ("yoy", "mom", "cum"):
+                if col in compare:
+                    select_parts.append(
+                        f"{alias}.metric_{col} AS {_safe_ident(code + '_' + col)}")
         sql = f"SELECT {', '.join(select_parts)}\nFROM (\n{subs[0][2]}\n) m0"
         for alias, _code, sub_sql in subs[1:]:
             on_parts = [f"m0.date_bucket = {alias}.date_bucket"]

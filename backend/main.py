@@ -33,18 +33,24 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, text
 
 from models import (
-    get_session, engine, STATUS_DRAFT, STATUS_PUBLISHED,
+    get_session, engine, ensure_schema, STATUS_DRAFT, STATUS_PUBLISHED,
     SubjectDomain, BusinessProcess, BusinessProcessField, Dimension, DimensionAttribute,
-    AtomicMetric, DerivedMetric, CompositeMetric, LogicalModel, DownstreamModel,
-    DownstreamApp, Dataset, AppDatasetGrant, ApiCallLog,
+    AtomicMetric, DerivedMetric, CompositeMetric, MetricModifier, LogicalModel,
+    DownstreamModel, DownstreamApp, Dataset, AppDatasetGrant, ApiCallLog,
     MetricVersion, Approval, QualityRule, Alert, TaskInstance, Schedule,
-    EntityTag, CodeRule,
+    EntityTag, CodeRule, CERT_LEVELS, COMPARE_TYPES, MODIFIER_TYPES,
 )
 from sql_generator import SQLGenerator, MetricNotFoundError, _safe_ident, GRANULARITY_FMT
 
 AGG_FUNCTIONS = ("SUM", "COUNT", "AVG", "MAX", "MIN", "COUNT_DISTINCT")
 TIME_PERIODS = ("1d", "7d", "30d", "90d", "ytd", "custom")
 FILTER_OPS = ("=", "!=", ">", ">=", "<", "<=", "IN", "NOT IN", "BETWEEN", "LIKE")
+COMPARE_LABELS = {"none": "无", "yoy": "同比", "mom": "环比",
+                  "yoy_mom": "同比+环比", "cumulative": "累计"}
+MODIFIER_TYPE_LABELS = {"time_period": "时间周期", "business_filter": "业务限定",
+                        "granularity": "统计粒度"}
+CERT_LABELS = {"UNVERIFIED": "未认证", "COMMON": "普通", "CERTIFIED": "认证",
+               "QUALITY": "优质"}
 DATASET_SOURCES = ("downstream_model", "metric_query")
 APP_STATUSES = ("ENABLED", "DISABLED")
 
@@ -52,6 +58,9 @@ router = APIRouter()
 openapi_router = APIRouter()
 gen = SQLGenerator()
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+# 轻量迁移：旧库启动时补齐新增表/列（修饰词库、同环比、Owner/认证/口径文档），幂等
+ensure_schema()
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +114,68 @@ def _check_dims(s, dim_codes: list):
     for dc in dim_codes or []:
         if not s.query(Dimension).filter_by(code=dc).first():
             raise HTTPException(400, f"维度不存在: {dc}")
+
+
+def _check_cert_level(cert_level: str):
+    if cert_level and cert_level not in CERT_LEVELS:
+        raise HTTPException(400, f"非法认证等级: {cert_level}，可选 {CERT_LEVELS}")
+
+
+def _check_compare_type(compare_type: str):
+    if compare_type not in COMPARE_TYPES:
+        raise HTTPException(400, f"非法同环比类型: {compare_type}，可选 {COMPARE_TYPES}")
+
+
+def _modifier_dict(m: MetricModifier) -> dict:
+    return {"id": m.id, "modifier_type": m.modifier_type,
+            "type_label": MODIFIER_TYPE_LABELS.get(m.modifier_type, m.modifier_type),
+            "code": m.code, "name": m.name, "config": m.config or {},
+            "description": m.description,
+            "created_at": (m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if m.created_at else ""),
+            "updated_at": (m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+                           if m.updated_at else "")}
+
+
+def _check_modifiers(s, modifier_codes: list, atomic_process=None):
+    """修饰词库引用校验 + 解析：返回 (time_period, dim_codes, filters)。
+    派生指标引用修饰词即不复用内嵌口径（库为准）；删除被引用修饰词返回 409"""
+    if not modifier_codes:
+        return None, None, None
+    seen = set()
+    period, dims, filters = None, [], []
+    for code in modifier_codes:
+        if code in seen:
+            continue
+        seen.add(code)
+        m = s.query(MetricModifier).filter_by(code=code).first()
+        if not m:
+            raise HTTPException(404, f"修饰词不存在: {code}")
+        cfg = m.config or {}
+        if m.modifier_type == "time_period":
+            p = cfg.get("period")
+            if p not in TIME_PERIODS:
+                raise HTTPException(400, f"修饰词 {m.code} 的时间周期非法: {p}")
+            period = p
+        elif m.modifier_type == "business_filter":
+            _check_filters(s, cfg.get("filters") or [])
+            filters.extend(cfg.get("filters") or [])
+        elif m.modifier_type == "granularity":
+            _check_dims(s, cfg.get("dim_codes") or [])
+            dims.extend(cfg.get("dim_codes") or [])
+        else:
+            raise HTTPException(400, f"修饰词类型非法: {m.modifier_type}")
+    return period, dims, filters
+
+
+def _modifiers_refs(s, modifier_codes: list):
+    """修饰词引用详情（供派生指标详情/列表展示）"""
+    out = []
+    for code in modifier_codes or []:
+        m = s.query(MetricModifier).filter_by(code=code).first()
+        if m:
+            out.append(_modifier_dict(m))
+    return out
 
 
 def _field_dict(f):
@@ -310,6 +381,9 @@ class AtomicIn(BaseModel):
     physical_field: str = Field(..., max_length=128)
     data_type: str = Field("DECIMAL", max_length=32)
     unit: str = Field("", max_length=64)
+    owner: str = Field("", max_length=64)
+    cert_level: str = Field("UNVERIFIED", max_length=16)
+    biz_definition: str = Field("", max_length=10000)
     description: str = Field("", max_length=2000)
     status: str = STATUS_DRAFT
 
@@ -344,8 +418,13 @@ class DerivedIn(BaseModel):
     time_period: str = "7d"
     dim_codes: list = []
     filters: list = []
+    modifier_codes: list = []            # 引用修饰词库（时间周期/业务限定/统计粒度）
+    compare_type: str = "none"           # none/yoy/mom/yoy_mom/cumulative 同环比自动派生
+    owner: str = Field("", max_length=64)
+    cert_level: str = Field("UNVERIFIED", max_length=16)
+    biz_definition: str = Field("", max_length=10000)
     description: str = Field("", max_length=2000)
-    status: str = STATUS_PUBLISHED
+    status: str = STATUS_DRAFT
 
 
 class CompositeIn(BaseModel):
@@ -355,8 +434,11 @@ class CompositeIn(BaseModel):
     ref_codes: list
     data_type: str = Field("DECIMAL", max_length=32)
     unit: str = Field("", max_length=64)
+    owner: str = Field("", max_length=64)
+    cert_level: str = Field("UNVERIFIED", max_length=16)
+    biz_definition: str = Field("", max_length=10000)
     description: str = Field("", max_length=2000)
-    status: str = STATUS_PUBLISHED
+    status: str = STATUS_DRAFT
 
 
 class LogicalModelIn(BaseModel):
@@ -371,6 +453,14 @@ class LogicalModelIn(BaseModel):
 
 class StatusIn(BaseModel):
     status: str
+
+
+class ModifierIn(BaseModel):
+    modifier_type: str = Field(..., max_length=32)
+    code: str = Field(..., max_length=64)
+    name: str = Field(..., max_length=128)
+    config: dict = {}
+    description: str = Field("", max_length=2000)
 
 
 class QueryRequest(BaseModel):
@@ -682,7 +772,9 @@ def create_atomic(body: AtomicIn):
         process = _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
         if body.agg_function not in AGG_FUNCTIONS:
             raise HTTPException(400, f"非法聚合方式: {body.agg_function}，可选 {AGG_FUNCTIONS}")
-        _check_status_arg(body.status)
+        if body.status != STATUS_DRAFT:
+            raise HTTPException(400, "新建指标只能为草稿（DRAFT），发布须提交审批流")
+        _check_cert_level(body.cert_level)
         _check_physical_field(s, process, body.physical_field)
         a = AtomicMetric(**body.dict())
         s.add(a)
@@ -716,6 +808,8 @@ def list_atomic_metrics(process_id: Optional[int] = None, status: Optional[str] 
             "physical_table": m.process.physical_table,
             "agg_function": m.agg_function, "physical_field": m.physical_field,
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
+            "owner": m.owner, "cert_level": m.cert_level,
+            "biz_definition": m.biz_definition,
             "description": m.description, "tags": tags.get(m.id, []),
         } for m in rows]
         return ok({"items": items, "total": total, "page": page, "page_size": page_size})
@@ -736,6 +830,8 @@ def get_atomic(metric_id: int):
             "physical_table": m.process.physical_table, "date_field": m.process.date_field,
             "agg_function": m.agg_function, "physical_field": m.physical_field,
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
+            "owner": m.owner, "cert_level": m.cert_level,
+            "biz_definition": m.biz_definition,
             "description": m.description,
             "tags": [t.tag for t in s.query(EntityTag)
                      .filter_by(entity_type="atomic_metric", entity_id=m.id).all()],
@@ -756,11 +852,13 @@ def update_atomic(metric_id: int, body: AtomicIn):
         process = _get_or_404(s, BusinessProcess, body.process_id, "业务过程")
         if body.agg_function not in AGG_FUNCTIONS:
             raise HTTPException(400, f"非法聚合方式: {body.agg_function}")
-        _check_status_arg(body.status)
+        _check_cert_level(body.cert_level)
         _check_physical_field(s, process, body.physical_field)
         _snapshot_version(s, "atomic_metric", m, "update", "编辑更新")
+        # 状态不随编辑改变（发布走审批流，归档走状态接口）
         for k, v in body.dict().items():
-            setattr(m, k, v)
+            if k != "status":
+                setattr(m, k, v)
         s.commit()
         return ok({"id": m.id})
     finally:
@@ -776,6 +874,10 @@ def delete_atomic(metric_id: int):
         n = s.query(DerivedMetric).filter_by(atomic_id=metric_id).count()
         if n:
             raise HTTPException(409, f"原子指标 {m.name} 被 {n} 个派生指标引用，禁止删除")
+        comp_using = [c.code for c in s.query(CompositeMetric).all()
+                      if m.code in (c.ref_codes or [])]
+        if comp_using:
+            raise HTTPException(409, f"原子指标 {m.name} 被复合指标引用: {', '.join(comp_using)}，禁止删除")
         ds = _refs_in_downstream(s, metric_code=m.code)
         qs = _refs_in_datasets(s, metric_code=m.code)
         if ds or qs:
@@ -788,17 +890,58 @@ def delete_atomic(metric_id: int):
         s.close()
 
 
+def _apply_status_transition(s, entity_type, m, target: str):
+    """指标状态机：DRAFT/PUBLISHED/ARCHIVED。
+    发布（->PUBLISHED）只能走审批流；归档可直切；归档后可重新启用为草稿"""
+    _check_status_arg(target)
+    cur = m.status
+    if cur == target:
+        return m.status
+    if target == STATUS_PUBLISHED:
+        raise HTTPException(400, "发布不能直接改状态：请先提交发布审批（草稿 → 审核 → 发布）")
+    if target == "ARCHIVED" and cur not in (STATUS_DRAFT, STATUS_PUBLISHED):
+        raise HTTPException(400, f"当前状态 {cur} 不能归档")
+    if target == STATUS_DRAFT and cur != "ARCHIVED":
+        raise HTTPException(400, "仅已归档指标可重新启用为草稿")
+    _snapshot_version(s, entity_type, m, "status",
+                      f"状态变更: {cur} -> {target}")
+    m.status = target
+    return m.status
+
+
 @router.post("/atomic-metrics/{metric_id}/status", tags=["原子指标"])
 def change_atomic_status(metric_id: int, body: StatusIn):
-    """发布/归档原子指标（状态变更；发布动作建议走审批流，此处保留直切能力）"""
+    """发布/归档原子指标：发布必须走审批流，直接置 PUBLISHED 返回 400"""
     s = get_session()
     try:
         m = _get_or_404(s, AtomicMetric, metric_id, "原子指标")
-        _check_status_arg(body.status)
-        if m.status != body.status:
-            _snapshot_version(s, "atomic_metric", m, "status",
-                              f"状态变更: {m.status} -> {body.status}")
-        m.status = body.status
+        _apply_status_transition(s, "atomic_metric", m, body.status)
+        s.commit()
+        return ok({"id": m.id, "code": m.code, "status": m.status})
+    finally:
+        s.close()
+
+
+@router.post("/derived-metrics/{metric_id}/status", tags=["派生指标"])
+def change_derived_status(metric_id: int, body: StatusIn):
+    """发布/归档派生指标：发布必须走审批流"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, DerivedMetric, metric_id, "派生指标")
+        _apply_status_transition(s, "derived_metric", m, body.status)
+        s.commit()
+        return ok({"id": m.id, "code": m.code, "status": m.status})
+    finally:
+        s.close()
+
+
+@router.post("/composite-metrics/{metric_id}/status", tags=["复合指标"])
+def change_composite_status(metric_id: int, body: StatusIn):
+    """发布/归档复合指标：发布必须走审批流"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, CompositeMetric, metric_id, "复合指标")
+        _apply_status_transition(s, "composite_metric", m, body.status)
         s.commit()
         return ok({"id": m.id, "code": m.code, "status": m.status})
     finally:
@@ -978,14 +1121,27 @@ def create_derived(body: DerivedIn):
         atomic = s.query(AtomicMetric).filter_by(code=body.atomic_code).first()
         if not atomic:
             raise HTTPException(404, f"原子指标不存在: {body.atomic_code}")
-        if body.time_period not in TIME_PERIODS:
-            raise HTTPException(400, f"非法时间周期: {body.time_period}，可选 {TIME_PERIODS}")
-        _check_filters(s, body.filters)
-        _check_dims(s, body.dim_codes)
+        if body.status != STATUS_DRAFT:
+            raise HTTPException(400, "新建指标只能为草稿（DRAFT），发布须提交审批流")
+        _check_cert_level(body.cert_level)
+        _check_compare_type(body.compare_type)
+        # 修饰词库：引用了修饰词则以其为准，内嵌周期/粒度/限定仅作展示回填
+        mod_period, mod_dims, mod_filters = _check_modifiers(s, body.modifier_codes)
+        if mod_period is not None:
+            time_period, dim_codes, filters = mod_period, mod_dims, mod_filters
+        else:
+            if body.time_period not in TIME_PERIODS:
+                raise HTTPException(400, f"非法时间周期: {body.time_period}，可选 {TIME_PERIODS}")
+            _check_filters(s, body.filters)
+            _check_dims(s, body.dim_codes)
+            time_period, dim_codes, filters = body.time_period, body.dim_codes, body.filters
         m = DerivedMetric(code=body.code, name=body.name, atomic_id=atomic.id,
-                          time_period=body.time_period, dim_codes=body.dim_codes,
-                          filters=body.filters, status=body.status,
-                          description=body.description)
+                          time_period=time_period, dim_codes=dim_codes,
+                          filters=filters, modifier_codes=list(dict.fromkeys(body.modifier_codes)),
+                          compare_type=body.compare_type, owner=body.owner,
+                          cert_level=body.cert_level,
+                          biz_definition=body.biz_definition,
+                          status=body.status, description=body.description)
         s.add(m)
         s.commit()
         return ok({"id": m.id, "code": m.code})
@@ -1014,7 +1170,11 @@ def list_derived(atomic_id: Optional[int] = None, keyword: str = "",
             "atomic_id": m.atomic_id, "atomic_code": m.atomic.code,
             "atomic_name": m.atomic.name,
             "time_period": m.time_period, "dim_codes": m.dim_codes or [],
-            "filters": m.filters or [], "status": m.status,
+            "filters": m.filters or [], "modifier_codes": m.modifier_codes or [],
+            "compare_type": m.compare_type or "none",
+            "owner": m.owner, "cert_level": m.cert_level,
+            "biz_definition": m.biz_definition,
+            "status": m.status,
             "description": m.description, "tags": tags.get(m.id, []),
         } for m in rows]
         return ok({"items": items, "total": total, "page": page, "page_size": page_size})
@@ -1045,7 +1205,13 @@ def get_derived(metric_id: int):
                        "date_field": m.atomic.process.date_field,
                        "unit": m.atomic.unit},
             "time_period": m.time_period, "dims": dims,
-            "filters": m.filters or [], "status": m.status,
+            "filters": m.filters or [],
+            "modifier_codes": m.modifier_codes or [],
+            "modifiers": _modifiers_refs(s, m.modifier_codes),
+            "compare_type": m.compare_type or "none",
+            "owner": m.owner, "cert_level": m.cert_level,
+            "biz_definition": m.biz_definition,
+            "status": m.status,
             "description": m.description, "composite_refs": refs,
             "tags": [t.tag for t in s.query(EntityTag)
                      .filter_by(entity_type="derived_metric", entity_id=m.id).all()],
@@ -1078,15 +1244,25 @@ def update_derived(metric_id: int, body: DerivedIn):
         atomic = s.query(AtomicMetric).filter_by(code=body.atomic_code).first()
         if not atomic:
             raise HTTPException(404, f"原子指标不存在: {body.atomic_code}")
-        if body.time_period not in TIME_PERIODS:
-            raise HTTPException(400, f"非法时间周期: {body.time_period}")
-        _check_filters(s, body.filters)
-        _check_dims(s, body.dim_codes)
+        _check_cert_level(body.cert_level)
+        _check_compare_type(body.compare_type)
+        mod_period, mod_dims, mod_filters = _check_modifiers(s, body.modifier_codes)
+        if mod_period is not None:
+            time_period, dim_codes, filters = mod_period, mod_dims, mod_filters
+        else:
+            if body.time_period not in TIME_PERIODS:
+                raise HTTPException(400, f"非法时间周期: {body.time_period}")
+            _check_filters(s, body.filters)
+            _check_dims(s, body.dim_codes)
+            time_period, dim_codes, filters = body.time_period, body.dim_codes, body.filters
         _snapshot_version(s, "derived_metric", m, "update", "编辑更新")
         m.atomic_id = atomic.id
+        # 状态不随编辑改变（发布走审批流，归档走状态接口）
         for k in ("code", "name", "time_period", "dim_codes", "filters",
-                  "status", "description"):
+                  "modifier_codes", "compare_type", "owner", "cert_level",
+                  "biz_definition", "description"):
             setattr(m, k, body.dict()[k])
+        m.modifier_codes = list(dict.fromkeys(m.modifier_codes or []))
         s.commit()
         return ok({"id": m.id})
     finally:
@@ -1121,10 +1297,12 @@ def delete_derived(metric_id: int):
 
 def _check_refs(s, ref_codes: list):
     if not ref_codes:
-        raise HTTPException(400, "复合指标必须引用至少一个派生指标")
+        raise HTTPException(400, "复合指标必须引用至少一个指标（派生或原子）")
     for rc in ref_codes:
-        if not s.query(DerivedMetric).filter_by(code=rc).first():
-            raise HTTPException(400, f"引用的派生指标不存在: {rc}")
+        dm = s.query(DerivedMetric).filter_by(code=rc).first()
+        am = s.query(AtomicMetric).filter_by(code=rc).first()
+        if not dm and not am:
+            raise HTTPException(400, f"引用的指标不存在: {rc}")
 
 
 _EXPR_TOKEN_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*|\d+(\.\d+)?|[+\-*/()]|\s+")
@@ -1156,6 +1334,9 @@ def create_composite(body: CompositeIn):
         _check_code_rule(s, "composite_metric", body.code)
         _check_refs(s, body.ref_codes)
         _check_expression(body.expression, body.ref_codes)
+        if body.status != STATUS_DRAFT:
+            raise HTTPException(400, "新建指标只能为草稿（DRAFT），发布须提交审批流")
+        _check_cert_level(body.cert_level)
         m = CompositeMetric(**body.dict())
         s.add(m)
         s.commit()
@@ -1181,6 +1362,8 @@ def list_composites(keyword: str = "", page: int = 1, page_size: int = 20):
             "id": m.id, "code": m.code, "name": m.name,
             "expression": m.expression, "ref_codes": m.ref_codes or [],
             "data_type": m.data_type, "unit": m.unit, "status": m.status,
+            "owner": m.owner, "cert_level": m.cert_level,
+            "biz_definition": m.biz_definition,
             "description": m.description, "tags": tags.get(m.id, []),
         } for m in rows]
         return ok({"items": items, "total": total, "page": page, "page_size": page_size})
@@ -1197,10 +1380,16 @@ def get_composite(metric_id: int):
         refs = []
         for code in (m.ref_codes or []):
             dm = s.query(DerivedMetric).filter_by(code=code).first()
+            am = s.query(AtomicMetric).filter_by(code=code).first()
             if dm:
-                refs.append({"code": dm.code, "name": dm.name,
+                refs.append({"code": dm.code, "name": dm.name, "type": "derived",
                              "atomic_code": dm.atomic.code,
                              "time_period": dm.time_period})
+            elif am:
+                refs.append({"code": am.code, "name": am.name, "type": "atomic",
+                             "agg_function": am.agg_function,
+                             "physical_field": am.physical_field,
+                             "time_period": "custom（查询窗口）"})
         _type, sql, params = _metric_sql(m.code)
         return ok({
             "id": m.id, "code": m.code, "name": m.name,
@@ -1237,9 +1426,12 @@ def update_composite(metric_id: int, body: CompositeIn):
         _check_code_rule(s, "composite_metric", body.code)
         _check_refs(s, body.ref_codes)
         _check_expression(body.expression, body.ref_codes)
+        _check_cert_level(body.cert_level)
         _snapshot_version(s, "composite_metric", m, "update", "编辑更新")
+        # 状态不随编辑改变（发布走审批流，归档走状态接口）
         for k, v in body.dict().items():
-            setattr(m, k, v)
+            if k != "status":
+                setattr(m, k, v)
         s.commit()
         return ok({"id": m.id})
     finally:
@@ -1258,6 +1450,109 @@ def delete_composite(metric_id: int):
         s.delete(m)
         s.commit()
         return ok({"deleted": metric_id})
+    finally:
+        s.close()
+
+
+# ===========================================================================
+# 5.6b 修饰词库：时间周期 / 业务限定 / 统计粒度 独立成库（可复用，不写死在派生指标）
+# ===========================================================================
+
+@router.post("/modifiers", tags=["修饰词库"])
+def create_modifier(body: ModifierIn):
+    s = get_session()
+    try:
+        _check_code(s, MetricModifier, body.code)
+        _check_code_rule(s, "modifier", body.code)
+        if body.modifier_type not in MODIFIER_TYPES:
+            raise HTTPException(400, f"非法修饰词类型: {body.modifier_type}，可选 {MODIFIER_TYPES}")
+        if body.modifier_type == "time_period":
+            if (body.config or {}).get("period") not in TIME_PERIODS:
+                raise HTTPException(400, f"时间周期修饰词 config.period 非法，可选 {TIME_PERIODS}")
+        elif body.modifier_type == "business_filter":
+            _check_filters(s, (body.config or {}).get("filters") or [])
+        elif body.modifier_type == "granularity":
+            _check_dims(s, (body.config or {}).get("dim_codes") or [])
+        m = MetricModifier(modifier_type=body.modifier_type, code=body.code,
+                           name=body.name, config=body.config or {},
+                           description=body.description)
+        s.add(m)
+        s.commit()
+        return ok({"id": m.id, "code": m.code})
+    finally:
+        s.close()
+
+
+@router.get("/modifiers", tags=["修饰词库"])
+def list_modifiers(modifier_type: Optional[str] = None, keyword: str = "",
+                   page: int = 1, page_size: int = 100):
+    s = get_session()
+    try:
+        q = s.query(MetricModifier)
+        if modifier_type:
+            if modifier_type not in MODIFIER_TYPES:
+                raise HTTPException(400, f"非法修饰词类型: {modifier_type}")
+            q = q.filter_by(modifier_type=modifier_type)
+        if keyword:
+            q = q.filter(or_(MetricModifier.code.like(f"%{_like_escape(keyword)}%", escape="\\"),
+                             MetricModifier.name.like(f"%{_like_escape(keyword)}%", escape="\\")))
+        total = q.count()
+        rows = (q.order_by(MetricModifier.modifier_type, MetricModifier.id)
+                .offset((_page_clamped(page) - 1) * _page_size_clamped(page_size))
+                .limit(_page_size_clamped(page_size)).all())
+        # 使用量：被多少派生指标引用
+        used = {}
+        for dm in s.query(DerivedMetric).all():
+            for code in (dm.modifier_codes or []):
+                used[code] = used.get(code, 0) + 1
+        items = []
+        for m in rows:
+            d = _modifier_dict(m)
+            d["used_by"] = used.get(m.code, 0)
+            items.append(d)
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
+    finally:
+        s.close()
+
+
+@router.put("/modifiers/{modifier_id}", tags=["修饰词库"])
+def update_modifier(modifier_id: int, body: ModifierIn):
+    s = get_session()
+    try:
+        m = _get_or_404(s, MetricModifier, modifier_id, "修饰词")
+        _check_code(s, MetricModifier, body.code, exclude_id=modifier_id)
+        _check_code_rule(s, "modifier", body.code)
+        if body.modifier_type not in MODIFIER_TYPES:
+            raise HTTPException(400, f"非法修饰词类型: {body.modifier_type}")
+        if body.modifier_type == "time_period":
+            if (body.config or {}).get("period") not in TIME_PERIODS:
+                raise HTTPException(400, f"时间周期修饰词 config.period 非法")
+        elif body.modifier_type == "business_filter":
+            _check_filters(s, (body.config or {}).get("filters") or [])
+        elif body.modifier_type == "granularity":
+            _check_dims(s, (body.config or {}).get("dim_codes") or [])
+        for k, v in body.dict().items():
+            setattr(m, k, v)
+        m.config = body.config or {}
+        s.commit()
+        return ok({"id": m.id})
+    finally:
+        s.close()
+
+
+@router.delete("/modifiers/{modifier_id}", tags=["修饰词库"])
+def delete_modifier(modifier_id: int):
+    """删除保护：被派生指标引用的修饰词禁止删除"""
+    s = get_session()
+    try:
+        m = _get_or_404(s, MetricModifier, modifier_id, "修饰词")
+        using = [dm.code for dm in s.query(DerivedMetric).all()
+                 if m.code in (dm.modifier_codes or [])]
+        if using:
+            raise HTTPException(409, f"修饰词 {m.name} 被派生指标引用: {', '.join(using)}，禁止删除")
+        s.delete(m)
+        s.commit()
+        return ok({"deleted": modifier_id})
     finally:
         s.close()
 
@@ -2298,11 +2593,16 @@ def _lineage_upstream(s, code: str, nodes: list, edges: list, seen: set):
                 continue
             seen.add(("composite", code, "derived", ref))
             dm = s.query(DerivedMetric).filter_by(code=ref).first()
+            am = s.query(AtomicMetric).filter_by(code=ref).first()
             if dm:
                 nodes.append({"id": f"derived:{ref}", "type": "derived",
                               "label": dm.name, "code": ref})
                 edges.append({"from": f"derived:{ref}", "to": f"composite:{code}"})
                 _lineage_upstream(s, ref, nodes, edges, seen)
+            elif am:
+                nodes.append(_atomic_node(am))
+                edges.append({"from": f"atomic:{ref}", "to": f"composite:{code}"})
+                _physical_nodes(am, nodes, edges)
 
     der = s.query(DerivedMetric).filter_by(code=code).first()
     if der:
@@ -2335,12 +2635,21 @@ def _lineage_downstream(s, code: str, nodes: list, edges: list):
             nodes.append({"id": f"derived:{dm.code}", "type": "derived",
                           "label": dm.name, "code": dm.code})
         for cm in composites:
+            # 复合引用派生：派生节点已出现时连边
             if dm.code in (cm.ref_codes or []) and \
                     any(n["id"] == f"derived:{dm.code}" for n in nodes):
                 if not any(n["id"] == f"composite:{cm.code}" for n in nodes):
                     nodes.append({"id": f"composite:{cm.code}", "type": "composite",
                                   "label": cm.name, "code": cm.code})
                 edges.append({"from": f"derived:{dm.code}",
+                              "to": f"composite:{cm.code}"})
+            # 复合直接引用原子：原子节点出现时连边
+            if has_atomic and code in (cm.ref_codes or []) and \
+                    any(n["id"] == f"atomic:{code}" for n in nodes):
+                if not any(n["id"] == f"composite:{cm.code}" for n in nodes):
+                    nodes.append({"id": f"composite:{cm.code}", "type": "composite",
+                                  "label": cm.name, "code": cm.code})
+                edges.append({"from": f"atomic:{code}",
                               "to": f"composite:{cm.code}"})
 
 
@@ -2705,6 +3014,56 @@ def rollback_version(version_id: int):
         s.close()
 
 
+_VERSION_DIFF_SKIP = ("id", "created_at", "updated_at")
+
+
+@router.get("/metric-versions/compare", tags=["治理"])
+def compare_versions(entity_type: str, entity_id: int,
+                     a: int, b: int):
+    """口径对比：逐字段 diff 两个版本快照（可对比发布前后口径变化）"""
+    s = get_session()
+    try:
+        va = s.query(MetricVersion).filter_by(id=a, entity_type=entity_type,
+                                              entity_id=entity_id).first()
+        vb = s.query(MetricVersion).filter_by(id=b, entity_type=entity_type,
+                                              entity_id=entity_id).first()
+        if not va or not vb:
+            raise HTTPException(404, "版本不存在（或不属于该实体）")
+        snap_a = json.loads(va.snapshot)
+        snap_b = json.loads(vb.snapshot)
+        fields = []
+        for k in sorted(set(snap_a) | set(snap_b)):
+            if k in _VERSION_DIFF_SKIP:
+                continue
+            old_v, new_v = snap_a.get(k), snap_b.get(k)
+            if isinstance(old_v, (list, dict)) or isinstance(new_v, (list, dict)):
+                changed = old_v != new_v
+                old_s = json.dumps(old_v, ensure_ascii=False) if old_v is not None else ""
+                new_s = json.dumps(new_v, ensure_ascii=False) if new_v is not None else ""
+            else:
+                changed = old_v != new_v
+                old_s = "" if old_v is None else str(old_v)
+                new_s = "" if new_v is None else str(new_v)
+            if changed:
+                fields.append({"key": k, "old": old_s, "new": new_s})
+        return ok({
+            "entity_type": entity_type, "entity_id": entity_id,
+            "a": {"id": va.id, "version_no": va.version_no,
+                  "change_type": va.change_type, "change_note": va.change_note,
+                  "created_at": va.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                  if va.created_at else ""},
+            "b": {"id": vb.id, "version_no": vb.version_no,
+                  "change_type": vb.change_type, "change_note": vb.change_note,
+                  "created_at": vb.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                  if vb.created_at else ""},
+            "changed_fields": fields,
+            "changed_count": len(fields),
+            "snapshot_a": snap_a, "snapshot_b": snap_b,
+        })
+    finally:
+        s.close()
+
+
 @router.post("/approvals", tags=["治理"])
 def submit_approval(body: ApprovalIn):
     """提交发布审批：DRAFT 状态的指标提交后进入审批流（同实体重复提交 409）"""
@@ -2830,13 +3189,15 @@ def impact_report(object_type: str, object_id: int):
             derived = [{"id": d.id, "code": d.code, "name": d.name}
                        for d in s.query(DerivedMetric).all()
                        if object_node["code"] in (d.dim_codes or [])]
-        # 复合指标引用（引用上述派生指标）
+        # 复合指标引用（引用上述派生指标，或直接引用原子指标）
         composite = []
-        for dm in derived:
-            for c in s.query(CompositeMetric).all():
-                if dm["code"] in (c.ref_codes or []) and \
-                        c.code not in [x["code"] for x in composite]:
-                    composite.append({"id": c.id, "code": c.code, "name": c.name})
+        for c in s.query(CompositeMetric).all():
+            refs = c.ref_codes or []
+            hit = any(dm["code"] in refs for dm in derived)
+            if object_type == "atomic_metric" and object_node["code"] in refs:
+                hit = True
+            if hit and c.code not in [x["code"] for x in composite]:
+                composite.append({"id": c.id, "code": c.code, "name": c.name})
         # 数据集 + 授权应用
         ds_codes = set()
         for h in hits:
@@ -3720,12 +4081,17 @@ def list_metrics():
         derived = [{"type": "derived", "id": m.id, "code": m.code, "name": m.name,
                     "atomic": m.atomic.code, "time_period": m.time_period,
                     "dim_codes": m.dim_codes or [], "filters": m.filters or [],
+                    "modifier_codes": m.modifier_codes or [],
+                    "compare_type": m.compare_type or "none",
+                    "owner": m.owner, "cert_level": m.cert_level,
                     "unit": m.atomic.unit, "status": m.status,
                     "description": m.description}
                    for m in s.query(DerivedMetric).all()]
         composite = [{"type": "composite", "id": m.id, "code": m.code, "name": m.name,
                       "expression": m.expression, "ref_codes": m.ref_codes or [],
-                      "unit": m.unit, "status": m.status, "description": m.description}
+                      "unit": m.unit, "status": m.status,
+                      "owner": m.owner, "cert_level": m.cert_level,
+                      "description": m.description}
                      for m in s.query(CompositeMetric).all()]
         return ok({"atomic": atomic, "derived": derived, "composite": composite})
     finally:

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Date, JSON, Text,
-    ForeignKey, UniqueConstraint, Index, create_engine,
+    ForeignKey, UniqueConstraint, Index, create_engine, inspect, text,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
@@ -132,6 +132,9 @@ class AtomicMetric(Base):
     physical_field = Column(String(64), nullable=False)     # 物理字段
     data_type = Column(String(32), default="DECIMAL")       # DECIMAL/INT/BIGINT
     unit = Column(String(32), default="")                   # 单位
+    owner = Column(String(64), default="")                 # 指标 Owner（责任人）
+    cert_level = Column(String(16), default="UNVERIFIED")  # 认证等级 UNVERIFIED/COMMON/CERTIFIED/QUALITY
+    biz_definition = Column(Text, default="")              # 业务口径文档
     status = Column(String(16), default=STATUS_DRAFT)       # DRAFT/PUBLISHED/ARCHIVED
     description = Column(Text, default="")
     created_at = Column(DateTime, default=now)
@@ -153,6 +156,11 @@ class DerivedMetric(Base):
     time_period = Column(String(8), default="custom")        # 1d/7d/30d/90d/ytd/custom
     dim_codes = Column(JSON, default=list)                   # 统计维度编码列表
     filters = Column(JSON, default=list)                     # 业务限定 [{field,op,value}]
+    modifier_codes = Column(JSON, default=list)              # 引用的修饰词库编码（时间周期/业务限定/统计粒度可复用）
+    compare_type = Column(String(16), default="none")        # none/yoy/mom/yoy_mom/cumulative 同比/环比/累计自动派生
+    owner = Column(String(64), default="")                   # 指标 Owner（责任人）
+    cert_level = Column(String(16), default="UNVERIFIED")    # 认证等级
+    biz_definition = Column(Text, default="")                # 业务口径文档
     status = Column(String(16), default=STATUS_PUBLISHED)
     description = Column(Text, default="")
     created_at = Column(DateTime, default=now)
@@ -170,10 +178,31 @@ class CompositeMetric(Base):
     ref_codes = Column(JSON, default=list)                   # 引用的指标编码列表
     data_type = Column(String(32), default="DECIMAL")
     unit = Column(String(32), default="")
+    owner = Column(String(64), default="")                 # 指标 Owner（责任人）
+    cert_level = Column(String(16), default="UNVERIFIED")  # 认证等级
+    biz_definition = Column(Text, default="")              # 业务口径文档
     status = Column(String(16), default=STATUS_PUBLISHED)
     description = Column(Text, default="")
     created_at = Column(DateTime, default=now)
     updated_at = Column(DateTime, default=now, onupdate=now)
+
+
+class MetricModifier(Base):
+    """修饰词库：时间周期 / 业务限定 / 统计粒度 独立成库，派生指标引用而非写死
+    config: time_period -> {"period": "7d"}；business_filter -> {"filters": [{field,op,value}]}
+            granularity -> {"dim_codes": ["dim_city"]}"""
+    __tablename__ = "meta_modifier"
+    id = Column(Integer, primary_key=True)
+    modifier_type = Column(String(32), nullable=False)     # time_period/business_filter/granularity
+    code = Column(String(64), unique=True, nullable=False)
+    name = Column(String(128), nullable=False)
+    config = Column(JSON, default=dict)
+    description = Column(Text, default="")
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
+    __table_args__ = (
+        Index("ix_modifier_type", "modifier_type"),
+    )
 
 
 class LogicalModel(Base):
@@ -500,6 +529,46 @@ class CodeRule(Base):
     entity_type = Column(String(32), unique=True, nullable=False)
     pattern = Column(String(256), nullable=False)
     example = Column(String(128), default="")
+
+
+CERT_LEVELS = ("UNVERIFIED", "COMMON", "CERTIFIED", "QUALITY")
+COMPARE_TYPES = ("none", "yoy", "mom", "yoy_mom", "cumulative")
+MODIFIER_TYPES = ("time_period", "business_filter", "granularity")
+
+
+def ensure_schema():
+    """轻量迁移（幂等）：旧库启动时补齐新增表与列，无需重建数据。
+    SQLite 不支持 ALTER 修改列，仅 ADD COLUMN（带默认值），新表由 create_all 补建"""
+    Base.metadata.create_all(engine)
+    new_cols = {
+        "meta_atomic_metric": [
+            ("owner", "VARCHAR(64) DEFAULT ''"),
+            ("cert_level", "VARCHAR(16) DEFAULT 'UNVERIFIED'"),
+            ("biz_definition", "TEXT DEFAULT ''"),
+        ],
+        "meta_derived_metric": [
+            ("modifier_codes", "TEXT DEFAULT '[]'"),
+            ("compare_type", "VARCHAR(16) DEFAULT 'none'"),
+            ("owner", "VARCHAR(64) DEFAULT ''"),
+            ("cert_level", "VARCHAR(16) DEFAULT 'UNVERIFIED'"),
+            ("biz_definition", "TEXT DEFAULT ''"),
+        ],
+        "meta_composite_metric": [
+            ("owner", "VARCHAR(64) DEFAULT ''"),
+            ("cert_level", "VARCHAR(16) DEFAULT 'UNVERIFIED'"),
+            ("biz_definition", "TEXT DEFAULT ''"),
+        ],
+    }
+    insp = __import__("sqlalchemy").inspect(engine)
+    for table, cols in new_cols.items():
+        if table not in insp.get_table_names():
+            continue
+        existing = {c["name"] for c in insp.get_columns(table)}
+        with engine.begin() as conn:
+            for col, ddl in cols:
+                if col not in existing:
+                    conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
 
 
 def init_db():
