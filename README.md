@@ -55,6 +55,41 @@ cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 
 依赖（已装于 `.venv`）：`fastapi uvicorn sqlalchemy openpyxl pytest httpx playwright`（走查脚本用，浏览器驱动优先复用系统 Chrome）
 
+## 云服务器部署（阿里云轻量应用服务器实测）
+
+```bash
+# 1. 本机生成依赖清单 + 上传（排除虚拟环境）
+.venv/bin/python -m pip freeze > requirements.txt
+rsync -az --delete -e ssh --exclude .venv --exclude .git --exclude __pycache__ \
+  ./ admin@<公网IP>:~/metric-demo/
+
+# 2. 服务器：建 venv + 装依赖（Alibaba Cloud Linux 4 / Python 3.11 实测）
+ssh admin@<公网IP>
+cd ~/metric-demo && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 3. systemd 守护（开机自启 + 崩溃自动重启；绑定 0.0.0.0 对外）
+sudo tee /etc/systemd/system/metric-demo.service > /dev/null <<'EOF'
+[Unit]
+Description=Metric Demo Platform (FastAPI)
+After=network.target
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/metric-demo/backend
+ExecStart=/home/admin/metric-demo/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl enable --now metric-demo
+
+# 4. 阿里云控制台：轻量应用服务器 → 防火墙 → 添加规则 TCP 8000
+#    本地回归：.venv/bin/python tests/e2e/walkthrough.py --base http://<公网IP>:8000
+```
+
+注意：`AllowOrigin` 跨域无需额外配置（同源部署）；更新代码后 `rsync` 重传 + `sudo systemctl restart metric-demo` 即可。
+
 ## 测试（三层）
 
 ### 第一层：后端 API 逻辑（pytest）
