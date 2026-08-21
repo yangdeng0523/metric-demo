@@ -49,7 +49,7 @@ cd backend && ../.venv/bin/python seed.py && cd ..
 cd backend && nohup ../.venv/bin/python main.py > /tmp/metric-demo.log 2>&1 &
 
 # 3. 浏览器访问
-#   http://127.0.0.1:8000         管理界面（16 个页签：统一指标查询/主题域/业务过程/原子/维度/派生/复合/逻辑模型/下游模型/任务重导/数据集/开放 API/血缘追溯/审批中心/质量监控/任务运维，右上角通知铃铛）
+#   http://127.0.0.1:8000         管理界面（17 个页签：统一指标查询/主题域/业务过程/原子/维度/派生/复合/修饰词库/审批中心/逻辑模型/下游模型/任务重导/数据集/开放 API/血缘追溯/质量监控/任务运维，右上角通知铃铛）
 #   http://127.0.0.1:8000/docs    Swagger API 文档（自动生成）
 ```
 
@@ -205,6 +205,8 @@ cd metric-demo
 | 审批 | `POST /approvals` | 提交发布审批（原子/派生/复合指标，`{entity_type, entity_id, comment}`；重复提交 409） |
 | 审批 | `GET /approvals?status=&page=` | 审批列表（status 过滤 pending/history）；通过后实体置 `PUBLISHED` 并生成版本 + 站内告警 |
 | 审批 | `POST /approvals/{id}/approve`、`POST /approvals/{id}/reject` | 同意（带意见）/ 驳回（带意见，状态不变） |
+| 版本对比 | `GET /metric-versions/compare?entity_type=&entity_id=&a=&b=` | 逐字段 diff 两个版本快照（口径变更审计） |
+| 修饰词库 | `GET/POST /modifiers`、`PUT/DELETE /modifiers/{id}` | 时间周期/业务限定/统计粒度词条 CRUD；被派生指标引用的词条删除返回 409，列表带 `used_by` 引用数 |
 | 影响评估 | `GET /impact-report?object_type=&object_id=` | **变更影响评估**：任意对象（原子/派生/复合/维度/逻辑模型/下游模型）→ 反查受影响的下游模型 + 派生引用 + 复合引用 + 关联数据集与授权应用，返回统计 + 血缘 chain |
 | 标签 | `POST /entity-tags`（`{entity_type, entity_id, tags:[]}` 全量替换）、`DELETE /entity-tags/{tag_id}` | 实体打标；所有列表/详情接口附带 `tags` 字段 |
 | 标签 | `GET /tags?keyword=`、`GET /tags/entities?tag=` | 全部标签（含计数）/ 按标签反查实体 |
@@ -283,6 +285,9 @@ curl -s -H "X-App-Key: <appkey>" -H "X-App-Secret: <appsecret>" \
 13. **质量规则与健康度**：四类规则（最小行数/行数波动/非空率/新鲜度）手动或自动校验（物化/重导/调度成功后自动触发）；健康度三色（green/yellow/red）一眼总览数据可信度；fail/error 自动生成站内告警
 14. **调度零依赖**：内置线程调度器（lifespan 启动，每 30s 扫描），支持 daily/interval 周期调度下游模型物化/重导，全程落任务实例（可筛选/详情/失败重试），不引入 APScheduler/cron 外部依赖
 15. **站内告警**：审批通过、质量检查失败、任务执行失败等自动写通知，右上角铃铛实时未读角标，可单条/全部已读
+16. **修饰词独立成库**：时间周期 / 业务限定 / 统计粒度词条可复用（管理端「修饰词库」页签 + `meta_modifier` 表），派生指标引用词条后以库为准——改库即改口径，自动影响全部引用指标；被引用词条禁止删除（409）
+17. **同环比 / 累计自动派生**：派生指标 `compare_type = none/yoy/mom/yoy_mom/cumulative`，查询端自动生成 `metric_yoy`（同比）/ `metric_mom`（环比）列，无需手工定义
+18. **指标治理三件套**：Owner 负责人、认证等级（`UNVERIFIED/COMMON/QUALITY/CERTIFIED`）、业务口径文档（`biz_definition`）；编辑 / 审批 / 回滚前全量自动存档，支持逐字段版本对比（口径变更留痕）
 
 ## 更多文档
 

@@ -34,6 +34,8 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg>派生指标</a>
       <a class="nav-item" data-tab="composites" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3L2 12l10 9 10-9-10-9z"/><circle cx="12" cy="12" r="3"/></svg>复合指标</a>
+      <a class="nav-item" data-tab="modifiers" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>修饰词库</a>
       <a class="nav-item" data-tab="approvals" href="#">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>审批中心</a>
       <a class="nav-item" data-tab="models" href="#">
@@ -218,6 +220,20 @@
             </div>
           </div>
           <div class="table-wrap"><table id="tbl-composites"></table></div>
+        </div>
+      </section>
+
+      <!-- ================== 修饰词库 ================== -->
+      <section class="tab-panel" id="tab-modifiers">
+        <div class="card">
+          <div class="card-head">
+            <h2>修饰词库 <span class="hint-text">时间周期 / 业务限定 / 统计粒度 独立成库：指标引用词条，改库即改口径，变更自动影响派生指标</span></h2>
+            <div class="card-actions">
+              <input type="text" id="kw-modifiers" placeholder="搜索编码/名称" style="height:32px;width:180px">
+              <button class="btn-primary" id="btn-new-modifier">+ 新建修饰词</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table id="tbl-modifiers"></table></div>
         </div>
       </section>
 

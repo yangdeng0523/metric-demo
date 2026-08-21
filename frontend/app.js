@@ -5,6 +5,10 @@ const API = "/api/v1";
 
 const TYPE_LABEL = { atomic: "原子指标", derived: "派生指标", composite: "复合指标" };
 const PERIOD_LABEL = { "1d": "最近1天", "7d": "最近7天", "30d": "最近30天", "90d": "最近90天", ytd: "年初至今", custom: "自定义" };
+const COMPARE_LABEL = { none: "无", yoy: "同比", mom: "环比", yoy_mom: "同比+环比", cumulative: "累计" };
+const CERT_LABEL = { UNVERIFIED: "未认证", COMMON: "普通", QUALITY: "质量认证", CERTIFIED: "高级认证" };
+const CERT_OPTIONS = Object.keys(CERT_LABEL).map(k => ({ value: k, label: `${CERT_LABEL[k]}（${k}）` }));
+const MODIFIER_TYPE_LABEL = { time_period: "时间周期", business_filter: "业务限定", granularity: "统计粒度" };
 const GRANULARITY_LABEL = { day: "日", week: "周", month: "月" };
 const STATUS_LABEL = { DRAFT: "草稿", PUBLISHED: "已发布", ARCHIVED: "已归档" };
 const FILTER_OPS = ["=", "!=", ">", ">=", "<", "<=", "IN", "NOT IN", "BETWEEN", "LIKE"];
@@ -29,6 +33,7 @@ const HEALTH_LABEL = { green: "健康", yellow: "关注", red: "告警" };
 
 // 全局状态（缓存，变更后刷新）
 let META = { atomic: [], derived: [], composite: [] };
+let MODIFIERS = [];
 let DIMS = [];
 let DOMAINS = [];
 let PROCESSES = [];
@@ -368,16 +373,18 @@ function closeModal() {
 
 // ---------------------------------------------------------------- 数据加载
 async function loadMeta() {
-  const [overview, metrics, dims, domains, processes, models, downstreams, apps, datasets] = await Promise.all([
+  const [overview, metrics, dims, domains, processes, models, downstreams, apps, datasets, modifiers] = await Promise.all([
     api("/overview"), api("/metrics"), api("/dimensions"),
     api("/domains?page_size=100"), api("/processes"), api("/logical-models"),
     api("/downstream-models?page_size=100"),
     api("/downstream-apps?page_size=100"), api("/datasets?page_size=100"),
+    api("/modifiers?page=1&page_size=100"),
   ]);
   META = metrics;
   DIMS = dims;
   DOMAINS = domains.items || domains;
   PROCESSES = processes;
+  MODIFIERS = modifiers.items || modifiers;
   LOGICAL_MODELS = models;
   DOWNSTREAMS = downstreams.items || downstreams;
   APPS = apps.items || apps;
@@ -415,7 +422,8 @@ const TITLES = {
   atomics: ["原子指标", "业务过程的度量值，由「业务过程 + 度量方式」构成，不可再拆分"],
   dims: ["维度与维度属性", "观察和分析数据的角度，属性的统一定义和管理"],
   derived: ["派生指标", "原子指标 + 修饰词（时间周期 / 统计粒度 / 筛选条件）派生为业务指标"],
-  composites: ["复合指标", "基于派生指标的四则运算，如 客单价 = 支付金额 ÷ 支付笔数"],
+  composites: ["复合指标", "基于派生指标的表达式运算（可直接引用原子指标），如 客单价 = 支付金额 ÷ 支付笔数"],
+  modifiers: ["修饰词库", "时间周期 / 业务限定 / 统计粒度 独立成库：指标引用词条，改库即改口径，变更自动影响派生指标"],
   approvals: ["审批中心", "指标提交发布后进入审批流程：同意 → 正式生效（PUBLISHED），驳回 → 保持原状态"],
   models: ["逻辑模型", "将物理表映射为逻辑模型，屏蔽底层表结构差异（P1）"],
   downstreams: ["下游模型", "基于逻辑模型 + 指标集合生成 DWS 汇总表，支持物化落地；上游更新上线后可按时间范围重导（默认近 3 个月）"],
@@ -442,6 +450,7 @@ function switchTab(tab) {
   else if (tab === "dims") renderDims();
   else if (tab === "derived") renderDerived();
   else if (tab === "composites") renderComposites();
+  else if (tab === "modifiers") renderModifiers();
   else if (tab === "approvals") renderApprovals();
   else if (tab === "models") renderModels();
   else if (tab === "downstreams") renderDownstreams();
@@ -775,12 +784,14 @@ async function saveTags(entityType, entityId, tags) {
 function renderAtomics() {
   const kw = $("kw-atomics").value.trim();
   api(`/atomic-metrics?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-atomics").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>业务过程</th><th>聚合方式</th><th>物理字段</th><th>单位</th><th>状态</th><th>标签</th><th style="width:300px">操作</th></tr></thead>
+    $("tbl-atomics").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>业务过程</th><th>聚合方式</th><th>物理字段</th><th>单位</th><th>负责人</th><th>认证等级</th><th>状态</th><th>标签</th><th style="width:300px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td><td>${esc(x.process_name)}</td>
         <td><span class="tag agg">${x.agg_function}</span></td>
         <td><span class="tag">${esc(x.physical_table)}.${esc(x.physical_field)}</span></td>
         <td>${esc(x.unit)}</td>
+        <td>${esc(x.owner) || '<span class="hint-text">-</span>'}</td>
+        <td>${certBadge(x.cert_level)}</td>
         <td>${statusBadge(x.status)}</td>
         <td>${tagChips(x.tags)}</td>
         <td>
@@ -789,7 +800,7 @@ function renderAtomics() {
           <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
-        </td></tr>`).join("") || `<tr><td colspan="9" class="empty">暂无原子指标</td></tr>`}</tbody>`;
+        </td></tr>`).join("") || `<tr><td colspan="11" class="empty">暂无原子指标</td></tr>`}</tbody>`;
   });
 }
 
@@ -798,8 +809,18 @@ function statusBadge(s) {
   return `<span class="badge status ${cls}">${STATUS_LABEL[s] || s}</span>`;
 }
 
+function certBadge(lv) {
+  const cls = { COMMON: "c1", QUALITY: "c2", CERTIFIED: "c3" }[lv] || "";
+  return `<span class="badge cert ${cls}">${CERT_LABEL[lv] || lv || "未认证"}</span>`;
+}
+
+function compareBadge(c) {
+  if (!c || c === "none") return '<span class="hint-text">-</span>';
+  return `<span class="badge soft">${COMPARE_LABEL[c] || c}</span>`;
+}
+
 async function atomicForm(id) {
-  let v = { code: "", name: "", process_id: PROCESSES[0]?.id ?? "", agg_function: "SUM", physical_field: "", data_type: "DECIMAL", unit: "", description: "", status: "DRAFT" };
+  let v = { code: "", name: "", process_id: PROCESSES[0]?.id ?? "", agg_function: "SUM", physical_field: "", data_type: "DECIMAL", unit: "", owner: "", cert_level: "UNVERIFIED", biz_definition: "", description: "", status: "DRAFT" };
   if (id) v = { ...v, ...(await api(`/atomic-metrics/${id}`)), id };
   openModal({
     title: id ? "编辑原子指标" : "新建原子指标",
@@ -822,7 +843,10 @@ async function atomicForm(id) {
         options: () => processFieldOptions(v.process_id, v.physical_field) },
       { key: "data_type", label: "数据类型", type: "select", options: ["DECIMAL", "INT", "BIGINT", "STRING", "DATE"].map(a => ({ value: a, label: a })) },
       { key: "unit", label: "单位", type: "text", placeholder: "如 元 / 次" },
+      { key: "owner", label: "负责人（Owner）", type: "text", placeholder: "如 张涛" },
+      { key: "cert_level", label: "认证等级", type: "select", options: CERT_OPTIONS },
       { key: "status", label: "状态", type: "status" },
+      { key: "biz_definition", label: "业务口径文档", type: "textarea", span: 2, placeholder: "口径唯一来源，变更自动留痕；如：统计支付成功流水，按支付日期归属" },
       { key: "description", label: "业务说明", type: "textarea", span: 2 },
       { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心指标" },
     ],
@@ -942,31 +966,44 @@ async function attrManager(dimId) {
 function renderDerived() {
   const kw = $("kw-derived").value.trim();
   api(`/derived-metrics?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-derived").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>原子指标</th><th>时间周期</th><th>统计粒度</th><th>业务限定</th><th>状态</th><th style="width:330px">操作</th></tr></thead>
+    $("tbl-derived").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>原子指标</th><th>时间周期</th><th>同环比</th><th>统计粒度</th><th>业务限定</th><th>负责人</th><th>认证等级</th><th>状态</th><th style="width:360px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td>
         <td><span class="tag agg">${esc(x.atomic_code)}</span></td>
         <td>${PERIOD_LABEL[x.time_period] || x.time_period}</td>
-        <td>${(x.dim_codes || []).map(c => `<code>${esc(c)}</code>`).join(" ") || '<span class="hint-text">-</span>'}</td>
-        <td>${(x.filters || []).map(f => `<code class="flt">${esc(f.field)} ${esc(f.op)} ${esc(Array.isArray(f.value) ? f.value.join(",") : f.value)}</code>`).join(" ") || '<span class="hint-text">无</span>'}</td>
+        <td>${compareBadge(x.compare_type)}</td>
+        <td>${(() => { const byType = (MODIFIERS || []).filter(m => (x.modifier_codes || []).includes(m.code));
+          const gran = byType.filter(m => m.modifier_type === "granularity").map(m => m.code);
+          return (gran.length ? gran : (x.dim_codes || [])).map(c => `<code>${esc(c)}</code>`).join(" ") || '<span class="hint-text">-</span>'; })()}</td>
+        <td>${(() => { const byType = (MODIFIERS || []).filter(m => (x.modifier_codes || []).includes(m.code));
+          const flt = byType.filter(m => m.modifier_type === "business_filter").map(m => m.code);
+          const chips = flt.map(c => `<code class="flt">${esc(c)}</code>`);
+          const inline = (x.filters || []).map(f => `<code class="flt">${esc(f.field)} ${esc(f.op)} ${esc(Array.isArray(f.value) ? f.value.join(",") : f.value)}</code>`).join(" ");
+          return (chips.join(" ") + (chips.length && inline ? " " : "") + inline) || '<span class="hint-text">无</span>'; })()}</td>
+        <td>${esc(x.owner) || '<span class="hint-text">-</span>'}</td>
+        <td>${certBadge(x.cert_level)}</td>
         <td>${statusBadge(x.status)}</td>
         <td>
+          <button class="btn-ghost btn-sm" data-act="status" data-id="${x.id}">${x.status === "PUBLISHED" ? "归档" : "提交发布"}</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm" data-act="sql" data-id="${x.id}">SQL</button>
           <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
           <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
-        </td></tr>`).join("") || `<tr><td colspan="8" class="empty">暂无派生指标</td></tr>`}</tbody>`;
+        </td></tr>`).join("") || `<tr><td colspan="11" class="empty">暂无派生指标</td></tr>`}</tbody>`;
   });
 }
 
 async function derivedForm(id) {
   let v = { code: "", name: "", atomic_code: META.atomic[0]?.code ?? "", time_period: "7d",
-            dim_codes: ["dim_city"], filters: [], description: "", status: "PUBLISHED" };
+            dim_codes: ["dim_city"], filters: [], modifier_codes: [], compare_type: "none",
+            owner: "", cert_level: "UNVERIFIED", biz_definition: "", description: "", status: "DRAFT" };
   if (id) {
     const d = await api(`/derived-metrics/${id}`);
     v = { ...v, code: d.code, name: d.name, atomic_code: d.atomic.code, time_period: d.time_period,
-          dim_codes: (d.dims || []).map(x => x.code), filters: d.filters, description: d.description, status: d.status };
+          dim_codes: (d.dims || []).map(x => x.code), filters: d.filters, modifier_codes: d.modifier_codes || [],
+          compare_type: d.compare_type || "none", owner: d.owner || "", cert_level: d.cert_level || "UNVERIFIED",
+          biz_definition: d.biz_definition || "", description: d.description, status: d.status };
   }
   openModal({
     title: id ? "编辑派生指标" : "新建派生指标（派生规则引擎）",
@@ -975,10 +1012,17 @@ async function derivedForm(id) {
       { key: "code", label: "编码", type: "text", required: true, placeholder: "如 pay_amount_30d_cat" },
       { key: "name", label: "名称", type: "text", required: true, placeholder: "如 最近30天各类目支付金额" },
       { key: "atomic_code", label: "原子指标（度量）", type: "select", required: true, options: META.atomic.map(a => ({ value: a.code, label: `${a.name}（${a.agg}(${a.field})）` })) },
-      { key: "time_period", label: "时间周期（修饰词 ①）", type: "select", required: true, options: Object.entries(PERIOD_LABEL).map(([k, l]) => ({ value: k, label: l })) },
-      { key: "dim_codes", label: "统计粒度（修饰词 ②）", type: "multi", options: DIMS.map(d => ({ value: d.code, label: d.name })) },
-      { key: "filters", label: "业务限定（修饰词 ③）", type: "filters", span: 2, hint: "运算符支持 = != > >= < <= IN NOT IN BETWEEN LIKE" },
+      { key: "time_period", label: "时间周期", type: "select", required: true, options: Object.entries(PERIOD_LABEL).map(([k, l]) => ({ value: k, label: l })) },
+      { key: "dim_codes", label: "统计粒度", type: "multi", options: DIMS.map(d => ({ value: d.code, label: d.name })) },
+      { key: "filters", label: "业务限定（内嵌）", type: "filters", span: 2, hint: "运算符支持 = != > >= < <= IN NOT IN BETWEEN LIKE；如勾选修饰词则以其为准" },
+      { key: "modifier_codes", label: "修饰词（可复用词条）", type: "multi", span: 2,
+        options: (MODIFIERS || []).map(m => ({ value: m.code, label: `${MODIFIER_TYPE_LABEL[m.modifier_type] || m.modifier_type} · ${m.name}（${m.code}）` })),
+        hint: "引用修饰词库：时间周期 / 业务限定 / 统计粒度；改库即改口径，引用自动影响全部指标" },
+      { key: "compare_type", label: "同环比自动派生", type: "select", options: Object.keys(COMPARE_LABEL).map(k => ({ value: k, label: COMPARE_LABEL[k] })) },
+      { key: "owner", label: "负责人（Owner）", type: "text", placeholder: "如 李雪" },
+      { key: "cert_level", label: "认证等级", type: "select", options: CERT_OPTIONS },
       { key: "status", label: "状态", type: "status" },
+      { key: "biz_definition", label: "业务口径文档", type: "textarea", span: 2, placeholder: "口径唯一来源，变更自动留痕；如：最近 7 天按城市汇总支付成功流水，同比与去年同窗口对比" },
       { key: "description", label: "业务说明", type: "textarea", span: 2 },
       { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心指标" },
     ],
@@ -1020,42 +1064,58 @@ function sqlPreviewModal(title, sql, params) {
 function renderComposites() {
   const kw = $("kw-composites").value.trim();
   api(`/composite-metrics?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
-    $("tbl-composites").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>计算表达式</th><th>引用指标</th><th>单位</th><th style="width:300px">操作</th></tr></thead>
+    $("tbl-composites").innerHTML = `<thead><tr><th>编码</th><th>名称</th><th>计算表达式</th><th>引用指标</th><th>单位</th><th>负责人</th><th>认证等级</th><th>状态</th><th style="width:360px">操作</th></tr></thead>
       <tbody>${(d.items || []).map(x => `<tr>
         <td><code>${esc(x.code)}</code></td><td>${esc(x.name)}</td>
         <td><code class="flt">${esc(x.expression)}</code></td>
         <td>${(x.ref_codes || []).map(c => `<span class="tag agg">${esc(c)}</span>`).join(" ")}</td>
         <td>${esc(x.unit)}</td>
+        <td>${esc(x.owner) || '<span class="hint-text">-</span>'}</td>
+        <td>${certBadge(x.cert_level)}</td>
+        <td>${statusBadge(x.status)}</td>
         <td>
+          <button class="btn-ghost btn-sm" data-act="status" data-id="${x.id}">${x.status === "PUBLISHED" ? "归档" : "提交发布"}</button>
           <button class="btn-ghost btn-sm" data-act="edit" data-id="${x.id}">编辑</button>
           <button class="btn-ghost btn-sm" data-act="sql" data-id="${x.id}">SQL</button>
           <button class="btn-ghost btn-sm" data-act="versions" data-id="${x.id}">版本</button>
           <button class="btn-ghost btn-sm" data-act="impact" data-id="${x.id}">影响</button>
           <button class="btn-ghost btn-sm danger" data-act="del" data-id="${x.id}">删除</button>
-        </td></tr>`).join("") || `<tr><td colspan="6" class="empty">暂无复合指标</td></tr>`}</tbody>`;
+        </td></tr>`).join("") || `<tr><td colspan="9" class="empty">暂无复合指标</td></tr>`}</tbody>`;
   });
 }
 
 async function compositeForm(id) {
-  let v = { code: "", name: "", expression: "", ref_codes: [], unit: "", description: "", status: "PUBLISHED" };
-  if (id) v = { ...v, ...(await api(`/composite-metrics/${id}`)) };
+  let v = { code: "", name: "", expression: "", ref_codes: [], unit: "", owner: "", cert_level: "UNVERIFIED", biz_definition: "", description: "", status: "DRAFT" };
+  if (id) {
+    const d = await api(`/composite-metrics/${id}`);
+    const li = (META.composite || []).find(m => m.id === id) || {};
+    v = { ...v, ...d, owner: d.owner ?? li.owner ?? "", cert_level: d.cert_level ?? li.cert_level ?? "UNVERIFIED",
+          biz_definition: d.biz_definition ?? li.biz_definition ?? "", id };
+  }
   openModal({
     title: id ? "编辑复合指标" : "新建复合指标",
     width: 720,
     fields: [
       { key: "code", label: "编码", type: "text", required: true, placeholder: "如 avg_order_value" },
       { key: "name", label: "名称", type: "text", required: true, placeholder: "如 客单价" },
-      { key: "ref_codes", label: "引用的派生指标", type: "multi", span: 2, options: META.derived.map(d => ({ value: d.code, label: `${d.name}（${d.code}）` })) },
-      { key: "expression", label: "计算表达式", type: "textarea", span: 2, required: true, placeholder: "如 pay_amount_7d_city / pay_count_7d_city", hint: "用派生指标编码参与四则运算，如 pay_amount_7d_city / pay_count_7d_city" },
+      { key: "ref_codes", label: "引用的指标（派生 + 原子）", type: "multi", span: 2,
+        options: [
+          ...META.derived.map(d => ({ value: d.code, label: `派生 · ${d.name}（${d.code}）` })),
+          ...META.atomic.map(a => ({ value: a.code, label: `原子 · ${a.name}（${a.code}）` })),
+        ] },
+      { key: "expression", label: "计算表达式", type: "textarea", span: 2, required: true, placeholder: "如 pay_amount_7d_city / pay_count_7d_city", hint: "用指标编码参与四则运算；引用原子指标时以查询窗口（所选日期范围）聚合" },
       { key: "unit", label: "单位", type: "text" },
+      { key: "owner", label: "负责人（Owner）", type: "text", placeholder: "如 李雪" },
+      { key: "cert_level", label: "认证等级", type: "select", options: CERT_OPTIONS },
       { key: "status", label: "状态", type: "status" },
+      { key: "biz_definition", label: "业务口径文档", type: "textarea", span: 2, placeholder: "口径唯一来源，变更自动留痕；如：平均每笔支付金额 = 支付金额 ÷ 支付笔数" },
       { key: "description", label: "业务说明", type: "textarea", span: 2 },
       { key: "tags", label: "标签", type: "tags", span: 2, placeholder: "回车添加，如 核心指标" },
     ],
     value: v,
     onOk: async (o) => {
       const refs = o.ref_codes || [];
-      if (!refs.length) throw new Error("请至少选择一个引用的派生指标");
+      if (!refs.length) throw new Error("请至少选择一个引用的指标（派生或原子）");
       for (const r of refs) {
         if (!o.expression.includes(r)) { throw new Error(`表达式未引用所选指标 ${r}`); }
       }
@@ -1064,6 +1124,60 @@ async function compositeForm(id) {
         await saveTags("composite_metric", id, o.tags || []);
       }
       else await post("/composite-metrics", o);
+      await refreshAll();
+    },
+  });
+}
+
+// ---------------------------------------------------------------- 修饰词库
+function renderModifiers() {
+  const kw = $("kw-modifiers").value.trim();
+  api(`/modifiers?page=1&page_size=100${kw ? "&keyword=" + encodeURIComponent(kw) : ""}`).then(d => {
+    $("tbl-modifiers").innerHTML = `<thead><tr><th>类型</th><th>编码</th><th>名称</th><th>配置（JSON）</th><th>被引用</th><th>说明</th><th style="width:150px">操作</th></tr></thead>
+      <tbody>${(d.items || []).map(m => `<tr>
+        <td><span class="tag agg">${MODIFIER_TYPE_LABEL[m.modifier_type] || esc(m.modifier_type)}</span></td>
+        <td><code>${esc(m.code)}</code></td><td>${esc(m.name)}</td>
+        <td><code class="flt">${esc(JSON.stringify(m.config || {}))}</code></td>
+        <td>${m.used_by ? `<span class="badge status pub">${m.used_by} 个指标</span>` : '<span class="hint-text">未引用</span>'}</td>
+        <td class="hint-text">${esc(m.description || "-")}</td>
+        <td>
+          <button class="btn-ghost btn-sm" data-act="edit" data-id="${m.id}">编辑</button>
+          <button class="btn-ghost btn-sm danger" data-act="del" data-id="${m.id}">删除</button>
+        </td></tr>`).join("") || '<tr><td colspan="7" class="empty">暂无修饰词，点击右上角新建（时间周期 / 业务限定 / 统计粒度）</td></tr>'}</tbody>`;
+  });
+}
+
+function modifierForm(id) {
+  const configHint = {
+    time_period: '{"period": "7d"}',
+    business_filter: '{"filters": [{"field": "pay_channel", "op": "=", "value": "WECHAT"}]}',
+    granularity: '{"dim_codes": ["dim_city"]}',
+  };
+  let v = { modifier_type: "time_period", code: "", name: "", config: "{}", description: "" };
+  if (id) {
+    const li = (MODIFIERS || []).find(m => m.id === id) || {};
+    v = { ...v, ...li, config: JSON.stringify(li.config || {}, null, 2) };
+  }
+  openModal({
+    title: id ? "编辑修饰词" : "新建修饰词",
+    width: 680,
+    fields: [
+      { key: "modifier_type", label: "类型", type: "select", required: true,
+        options: Object.keys(MODIFIER_TYPE_LABEL).map(k => ({ value: k, label: MODIFIER_TYPE_LABEL[k] })) },
+      { key: "code", label: "编码", type: "text", required: true, placeholder: "如 period_7d / filter_valid_order / gran_city" },
+      { key: "name", label: "名称", type: "text", required: true, placeholder: "如 最近7天 / 有效订单 / 按城市" },
+      { key: "config", label: "配置（JSON）", type: "textarea", span: 2, required: true, placeholder: configHint[v.modifier_type] },
+      { key: "description", label: "说明", type: "textarea", span: 2 },
+    ],
+    value: v,
+    onOk: async (o) => {
+      let config = {};
+      try { config = JSON.parse(o.config || "{}"); }
+      catch { throw new Error("配置必须是合法 JSON，如 " + (configHint[o.modifier_type] || "{}")); }
+      o.modifier_type = o.modifier_type || "time_period";
+      o.config = config;
+      if (id) await put(`/modifiers/${id}`, o);
+      else await post("/modifiers", o);
       await refreshAll();
     },
   });
@@ -1455,19 +1569,23 @@ async function versionsModal(entityType, entityId) {
   openModal({ title: "版本历史（变更前快照，最新在前）", width: 760, fields: [], onOk: async () => {} });
   $("modal-ok").style.display = "none";
   $("modal-cancel").textContent = "关 闭";
-  const listHtml = () => (d.items || []).map(v => `<tr>
+  const listHtml = () => (d.items || []).map((v, i) => {
+    const older = (d.items || [])[i + 1];
+    return `<tr>
     <td><span class="badge status pub">${esc(v.version_no)}</span></td>
     <td>${VERSION_CHANGE_LABEL[v.change_type] || v.change_type}</td>
     <td class="hint-text">${esc(v.change_note || "-")}</td>
     <td class="hint-text">${esc(v.created_at)}</td>
     <td>
       <button class="btn-ghost btn-sm" data-v-snap="${v.id}">快照</button>
+      ${older ? `<button class="btn-ghost btn-sm" data-v-compare="${older.id}">对比</button>` : ""}
       <button class="btn-ghost btn-sm danger" data-v-rollback="${v.id}">回滚</button>
-    </td></tr>`).join("");
+    </td></tr>`;
+  }).join("");
   const renderList = () => {
     $("modal-title").textContent = "版本历史（变更前快照，最新在前）";
     $("modal-body").innerHTML = `<div class="hint-text" style="margin-bottom:10px">每次编辑 / 状态变更 / 审批发布前自动存档；回滚将把该版本快照写回实体并生成 rollback 版本记录</div>
-      <div class="table-wrap"><table><thead><tr><th>版本</th><th>类型</th><th>说明</th><th>时间</th><th style="width:130px">操作</th></tr></thead>
+      <div class="table-wrap"><table><thead><tr><th>版本</th><th>类型</th><th>说明</th><th>时间</th><th style="width:190px">操作</th></tr></thead>
       <tbody>${listHtml() || '<tr><td colspan="5" class="empty">暂无版本记录（编辑 / 审批等变更会自动存档）</td></tr>'}</tbody></table></div>`;
     $("modal-body").querySelectorAll("[data-v-snap]").forEach(b => b.onclick = () => {
       const ver = (d.items || []).find(v => v.id === Number(b.dataset.vSnap));
@@ -1480,6 +1598,21 @@ ${esc(ver.change_note || "无说明")}</pre></div>
       </div>
       <div style="margin-top:14px"><button class="btn-ghost btn-sm" id="v-back">← 返回版本列表</button></div>`;
       $("v-back").onclick = renderList;
+    });
+    $("modal-body").querySelectorAll("[data-v-compare]").forEach(b => b.onclick = async () => {
+      const olderId = Number(b.dataset.vCompare);
+      const self = (d.items || []).find(v => v.id === Number(b.closest("tr").querySelector("[data-v-snap]").dataset.vSnap));
+      if (!self) return;
+      try {
+        const r = await api(`/metric-versions/compare?entity_type=${entityType}&entity_id=${entityId}&a=${olderId}&b=${self.id}`);
+        const row = f => `<tr><td class="hint-text" style="width:120px">${esc(f.key)}</td><td><code class="flt">${esc(f.old || "（空）")}</code></td><td><code class="flt">${esc(f.new || "（空）")}</code></td></tr>`;
+        $("modal-title").textContent = `口径对比 · ${r.a.version_no} → ${r.b.version_no}`;
+        $("modal-body").innerHTML = `<div class="hint-text" style="margin-bottom:10px">${esc(r.a.version_no)}（${VERSION_CHANGE_LABEL[r.a.change_type] || r.a.change_type} · ${esc(r.a.created_at)}） → ${esc(r.b.version_no)}（${VERSION_CHANGE_LABEL[r.b.change_type] || r.b.change_type} · ${esc(r.b.created_at)}）<br>共 ${r.changed_count} 个字段发生口径变更</div>
+          <div class="table-wrap"><table><thead><tr><th>字段</th><th>旧值（${esc(r.a.version_no)}）</th><th>新值（${esc(r.b.version_no)}）</th></tr></thead>
+          <tbody>${(r.changed_fields || []).map(row).join("") || '<tr><td colspan="3" class="empty">两个版本口径一致</td></tr>'}</tbody></table></div>
+          <div style="margin-top:14px"><button class="btn-ghost btn-sm" id="v-back">← 返回版本列表</button></div>`;
+        $("v-back").onclick = renderList;
+      } catch (e) { toast(e.message, false); }
     });
     $("modal-body").querySelectorAll("[data-v-rollback]").forEach(b => b.onclick = async () => {
       const ver = (d.items || []).find(v => v.id === Number(b.dataset.vRollback));
@@ -2480,6 +2613,15 @@ function bindEvents() {
     }
     else if (btn.dataset.act === "versions") versionsModal("derived_metric", id).catch(err => toast(err.message, false));
     else if (btn.dataset.act === "impact") impactModal("derived_metric", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "status") {
+      const cur = (META.derived.find(m => m.id === id) || {}).status;
+      if (cur === "PUBLISHED") {
+        post(`/derived-metrics/${id}/status`, { status: "ARCHIVED" }).then(refreshAll).catch(e => toast(e.message, false));
+      } else {
+        const m = META.derived.find(m => m.id === id) || {};
+        submitApproval("derived_metric", id, m.name || "");
+      }
+    }
   });
 
   // 复合
@@ -2495,6 +2637,25 @@ function bindEvents() {
     }
     else if (btn.dataset.act === "versions") versionsModal("composite_metric", id).catch(err => toast(err.message, false));
     else if (btn.dataset.act === "impact") impactModal("composite_metric", id).catch(err => toast(err.message, false));
+    else if (btn.dataset.act === "status") {
+      const cur = (META.composite.find(m => m.id === id) || {}).status;
+      if (cur === "PUBLISHED") {
+        post(`/composite-metrics/${id}/status`, { status: "ARCHIVED" }).then(refreshAll).catch(e => toast(e.message, false));
+      } else {
+        const m = META.composite.find(m => m.id === id) || {};
+        submitApproval("composite_metric", id, m.name || "");
+      }
+    }
+  });
+
+  // 修饰词库
+  $("btn-new-modifier").onclick = listenerWrap(() => modifierForm());
+  $("tbl-modifiers").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = Number(btn.dataset.id);
+    if (btn.dataset.act === "edit") modifierForm(id);
+    else if (btn.dataset.act === "del") confirmDelete("删除该修饰词？（被派生指标引用将拒绝）", () => del(`/modifiers/${id}`));
   });
 
   // 逻辑模型
@@ -2582,7 +2743,7 @@ function bindEvents() {
     b.onclick = () => { LINEAGE_VIEW = b.dataset.view; renderLineage(); });
 
   // 各列表搜索（回车触发）
-  ["domains", "processes", "atomics", "dims", "derived", "composites", "downstreams", "datasets", "apps"].forEach(tab => {
+  ["domains", "processes", "atomics", "dims", "derived", "composites", "modifiers", "downstreams", "datasets", "apps"].forEach(tab => {
     const el = $("kw-" + tab);
     el.addEventListener("keydown", e => { if (e.key === "Enter") switchTab(tab); });
   });

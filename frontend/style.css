@@ -199,6 +199,10 @@ code {
 .badge.status { background: var(--bg); color: var(--text-2); border: 1px solid var(--border); }
 .badge.status.pub { background: var(--success-50); color: #389e0d; border-color: #b7eb8f; }
 .badge.status.arch { background: var(--danger-50); color: #cf1322; border-color: #ffa39e; }
+.badge.cert { background: var(--bg); color: var(--text-2); border: 1px solid var(--border); }
+.badge.cert.c1 { background: #e6f4ff; color: #0958d9; border-color: #91caff; }
+.badge.cert.c2 { background: var(--warning-50); color: #d46b08; border-color: #ffe58f; }
+.badge.cert.c3 { background: var(--success-50); color: #389e0d; border-color: #b7eb8f; }
 .tag {
   display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 12px;
   background: var(--primary-50); color: var(--primary-600);
